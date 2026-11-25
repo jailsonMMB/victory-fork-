@@ -163,13 +163,33 @@ static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
-/// bytes; the waits for the card the fetches added and their microseconds.
-pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// bytes; the waits for the card the fetches added and their microseconds;
+/// and, since the pieces put back cost what a run costs and not what a
+/// byte costs, the runs, the kernel's calls and the merge between them.
+///
+/// These are counted always, not only with the `diagnostics` feature: the
+/// frame's largest cost without the swapchain in the way is this one, and
+/// it was invisible in a plain build.
+pub(crate) static CARD_STATS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+
+/// The indices of [`CARD_STATS`] the putting back of pieces uses.
+pub(crate) mod card_stat {
+    /// Runs given to `card_merge` (a piece or several joined).
+    pub(crate) const RUNS: usize = 10;
+    /// The kernel's reads of title memory, and their microseconds.
+    pub(crate) const READS: usize = 11;
+    pub(crate) const READ_US: usize = 12;
+    /// The kernel's writes into title memory, and their microseconds.
+    pub(crate) const WRITES: usize = 13;
+    pub(crate) const WRITE_US: usize = 14;
+    /// The byte-by-byte merge between them.
+    pub(crate) const MERGE_US: usize = 15;
+}
 
 /// [`CARD_STATS`], taken; then the copies in the card's memory, their
 /// bytes and their "before" twins' bytes.
-pub(crate) fn card_stats() -> [u64; 10] {
-    let mut out = [0u64; 10];
+pub(crate) fn card_stats() -> [u64; 16] {
+    let mut out = [0u64; 16];
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
@@ -2697,12 +2717,20 @@ impl Shadow {
         let last = last_difference(gpu, old).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
+        CARD_STATS[card_stat::RUNS].fetch_add(1, Ordering::Relaxed);
         title.clear();
         title.resize(n, 0);
         let mut written = 0;
-        if crate::host::read_into((start + at) as *const u8, title) {
+        // (counted always: this is the frame's largest cost without the
+        // swapchain in the way, and a plain build saw none of it.)
+        let reading = std::time::Instant::now();
+        let read = crate::host::read_into((start + at) as *const u8, title);
+        CARD_STATS[card_stat::READS].fetch_add(1, Ordering::Relaxed);
+        CARD_STATS[card_stat::READ_US].fetch_add(reading.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if read {
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
+            let merging = std::time::Instant::now();
             let mut differs = 0u8;
             for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
                 let wrote = if *g != *o { 0xffu8 } else { 0 };
@@ -2711,9 +2739,13 @@ impl Shadow {
                 *t = merged;
                 *o = merged;
             }
+            CARD_STATS[card_stat::MERGE_US].fetch_add(merging.elapsed().as_micros() as u64, Ordering::Relaxed);
             if differs != 0 {
+                let writing = std::time::Instant::now();
                 crate::watch::writing(start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                CARD_STATS[card_stat::WRITE_US].fetch_add(writing.elapsed().as_micros() as u64, Ordering::Relaxed);
+                CARD_STATS[card_stat::WRITES].fetch_add(1, Ordering::Relaxed);
                 written = n;
             }
         } else {
@@ -3335,18 +3367,20 @@ pub(crate) fn near(va: u64) -> String {
 mod short_run_tests {
     use super::{SMALL_RUN, merge_short_runs};
 
-    /// Every byte of a run is a byte of some run in the output, no byte of
-    /// the output lies outside the input's runs.
+    /// Every byte the input covers, the output covers (a merged run also
+    /// covers the bytes between the runs it joined, which is the point).
     fn covers(input: &[(usize, usize)], output: &[(usize, usize)]) -> bool {
-        let mut want = vec![false; 1 << 20];
-        for &(at, n) in input {
-            want[at..at + n].fill(true);
-        }
         let mut got = vec![false; 1 << 20];
         for &(at, n) in output {
             got[at..at + n].fill(true);
         }
-        want == got
+        input.iter().all(|&(at, n)| got[at..at + n].iter().all(|&b| b))
+    }
+
+    /// And no output run reaches past the last byte of the input.
+    fn contained(input: &[(usize, usize)], output: &[(usize, usize)]) -> bool {
+        let end = input.iter().map(|&(at, n)| at + n).max().unwrap_or(0);
+        output.iter().all(|&(at, n)| at + n <= end)
     }
 
     #[test]
@@ -3355,8 +3389,8 @@ mod short_run_tests {
         // two tiny runs (a shader setting a counter) far apart, and one long
         let input = vec![(0x100, 4), (0x1000, 8), (0x8000, long), (0x20000, 4)];
         let out = merge_short_runs(input.clone());
-        assert!(covers(&input, &out), "the merged runs cover exactly the input's: {out:?}");
-        assert!(out.iter().all(|&(at, n)| n >= SMALL_RUN || at == 0x8000), "every short run joined: {out:?}");
+        assert!(covers(&input, &out), "every byte the input covers, the output covers: {out:?}");
+        assert!(contained(&input, &out), "and nothing past its end: {out:?}");
         assert!(out.len() < input.len(), "fewer runs than in: {out:?}");
     }
 
@@ -3375,6 +3409,7 @@ mod short_run_tests {
         let input = vec![(0, SMALL_RUN * 2), (SMALL_RUN * 4, 4), (SMALL_RUN * 8, SMALL_RUN * 2)];
         let out = merge_short_runs(input.clone());
         assert!(covers(&input, &out));
+        assert!(contained(&input, &out));
         assert_eq!(out, vec![(0, SMALL_RUN * 4 + 4), (SMALL_RUN * 8, SMALL_RUN * 2)]);
     }
 

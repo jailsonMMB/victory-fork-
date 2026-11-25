@@ -1615,6 +1615,11 @@ fn wide_merge() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_none_or(|v| v != "0"))
 }
 
+/// Pieces of a copy in the card's memory closer than this are fetched and
+/// put back as one run (`VICTORY_COPYBACK_SMALL=1`): under 4 KiB of extra
+/// bytes to read and write, for one kernel call less.
+const SMALL_GAP: usize = 4 << 10;
+
 /// One declared range of a copy in the card's memory, in a submission.
 struct CardRange {
     shadow: std::sync::Arc<crate::shadow::Shadow>,
@@ -3784,8 +3789,9 @@ impl Host {
         // The pieces to fetch: which plan and range, the offsets in the
         // copy, and where the bytes come down. One fetch for every plan: a
         // flight's pieces wait for the card once, together.
-        let mut pieces: Vec<(usize, usize, usize, usize, u64)> = Vec::new();
-        let mut total = 0u64;
+        // (a piece's place in the fetched buffer is given after the joins
+        // below: a join grows a piece, and the bytes after it move.)
+        let mut found: Vec<(usize, usize, usize, usize)> = Vec::new();
         for (k, plan) in plans.iter().enumerate() {
             for (i, r) in plan.ranges.iter().enumerate() {
                 for p in 0..r.span.pieces {
@@ -3794,12 +3800,38 @@ impl Host {
                     }
                     let (lo, hi) = r.shadow.card_piece(&r.span, p);
                     if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
-                        pieces.push((k, i, lo, hi, total));
-                        total += (hi - lo) as u64;
+                        found.push((k, i, lo, hi));
                     }
                 }
                 crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
             }
+        }
+        // A run costs a kernel read and a write whatever its size
+        // (`Shadow::card_merge`), and the compare fetches by 64 KiB piece:
+        // two pieces with a word written in each were two runs at two
+        // kernel calls. Pieces that touch are one run, always (`hand_back`
+        // has always joined them; this path never did, so a buffer written
+        // all over was a kernel call per 64 KiB). With
+        // `VICTORY_COPYBACK_SMALL=1` the runs that only fall close together
+        // are joined too, and the bytes between them go to title memory as
+        // they already are (the merge writes the copy's bytes only where
+        // the card changed them).
+        {
+            let close = if crate::shadow::merge_small_runs() { SMALL_GAP } else { 0 };
+            let mut joined: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(found.len());
+            for (k, i, lo, hi) in found {
+                match joined.last_mut() {
+                    Some(last) if last.0 == k && last.1 == i && last.3 + close >= lo => last.3 = hi,
+                    _ => joined.push((k, i, lo, hi)),
+                }
+            }
+            found = joined;
+        }
+        let mut pieces: Vec<(usize, usize, usize, usize, u64)> = Vec::with_capacity(found.len());
+        let mut total = 0u64;
+        for (k, i, lo, hi) in found {
+            pieces.push((k, i, lo, hi, total));
+            total += (hi - lo) as u64;
         }
         let mut written: Vec<Vec<usize>> =
             plans.iter().map(|plan| vec![0usize; plan.ranges.len()]).collect();
@@ -6175,6 +6207,30 @@ impl Meter {
                     per_frame(5),
                     per_frame(6) / 1e3
                 );
+                // Where "copying back" goes on a card with copies of its
+                // own: a run costs a kernel read, a write and a note of the
+                // write, and what a run's size is does not change that, so
+                // the count of runs is the count of kernel calls.
+                use crate::shadow::card_stat;
+                let runs = card[card_stat::RUNS];
+                if runs > 0 {
+                    // Every run reads title memory; only those the card
+                    // changed something in are written back.
+                    let writes = card[card_stat::WRITES];
+                    let calls = runs + writes;
+                    let kernel_us = (card[card_stat::READ_US] + card[card_stat::WRITE_US]) as f64;
+                    tracing::info!(
+                        "  the pieces put back, per frame: {:.0} runs with a byte that differs, {:.0} kernel reads \
+                         and {:.0} kernel writes ({:.2} ms a call, {:.1} ms in all), the byte merge between them \
+                         {:.1} ms (VICTORY_COPYBACK_SMALL=1 joins runs under 4 KiB)",
+                        runs as f64 / frames,
+                        card[card_stat::READS] as f64 / frames,
+                        writes as f64 / frames,
+                        if calls > 0 { kernel_us / 1e3 / calls as f64 } else { 0.0 },
+                        kernel_us / 1e3 / frames,
+                        card[card_stat::MERGE_US] as f64 / 1e3 / frames
+                    );
+                }
             }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
