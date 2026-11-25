@@ -303,7 +303,11 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// is remapping may show a frame later. It never shows partly read.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    // On by default (was opt-in): waiting for the runtime's remap lock
+    // while it streams was seconds a frame on Wine; reading through the
+    // kernel instead costs ~0.3 ms/MB more but never waits.
+    // `VICTORY_TEXTURE_NO_WAIT=0` waits as before.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
@@ -981,7 +985,11 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     }
     if !by_query() {
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
+        // By page by default (was by 64 KiB block): one batched
+        // `QueryWorkingSetEx` per megabyte, not one kernel call per
+        // 64 KiB block (262k calls for 4k textures were seconds a frame
+        // on Wine). `VICTORY_MAPPED_BY_PAGE=0` goes back to blocks.
+        if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_none_or(|v| v != "0")) {
             // By page, without the walk: whole pages, cut to the range.
             let (there, _) = readable(start, len, false);
             return (there as u64 * 4096).min(len as u64);

@@ -1374,6 +1374,13 @@ impl<'a> Lower<'a> {
                     eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
                 }
             }
+            // Local waves: each host wave is a wave of its own, so the host
+            // wave size is 32 even when the console wave is 64 and cross-lane
+            // code would otherwise keep 64 (NVIDIA refuses `WaveSize(64)`,
+            // `E_INVALIDARG` on `CreateComputePipelineState`).
+            if LOCAL_WAVES.get() && wave == 64 && x.native.wave64 {
+                wave = 32;
+            }
             if wave == 32 && x.native.wave64 {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
                 halves = Some(s.lds_dwords);
