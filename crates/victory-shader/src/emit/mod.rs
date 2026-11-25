@@ -333,6 +333,11 @@ fn translated(container: &[u8], implicit: bool) -> Result<HostShader, ShaderErro
     }
 }
 
+/// The tail of the refusals (`lower`'s "a lane read where not every lane runs",
+/// "a lane mask exchanged ...") that a form where every lane runs the block can
+/// answer.
+const EXCHANGED: &str = "where not every lane runs";
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -358,6 +363,13 @@ pub fn emit(
     // (a mask with lanes elsewhere is only helped by the exact forms: not by each half-wave
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
+    // ... and so is a mask exchanged where not every lane runs: only a form where
+    // every lane runs that block (the whole-wave branches of `widen`, or the
+    // skips left out) can exchange it.
+    let exchanged = matches!(
+        &original,
+        Err(ShaderError::Unsupported { what, .. }) if what.ends_with(EXCHANGED)
+    );
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
@@ -415,10 +427,16 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        // A mask with lanes elsewhere (`exact_only`) is only helped by the
-        // exact forms, and `widen` is one of them: try it even without
-        // `VICTORY_WAVE_WIDE=1` (shader `f133e35efed2a48a` stops there).
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || exact_only;
+        // A mask with lanes elsewhere (`exact_only`), or exchanged (`exchanged`), where not
+        // every lane runs is only helped by the exact forms, and `widen` is one of them: try
+        // it even without `VICTORY_WAVE_WIDE=1` (shader `f133e35efed2a48a` stops there).
+        // `VICTORY_WAVE_EXCHANGE=0` keeps the refusal instead, for the whole-wave barriers
+        // `widen` puts inside branches and loops.
+        let exchange_wide = exchanged
+            && std::env::var_os("VICTORY_WAVE_EXCHANGE").is_none_or(|v| v != "0");
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
+            || exact_only
+            || exchange_wide;
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {

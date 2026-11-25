@@ -3111,6 +3111,18 @@ impl<'a> Lower<'a> {
                         }
                     } else if !self.exchange.as_ref().is_some_and(|e| e.1) && !b.is_none_or(|b| self.all_lanes(b)) {
                         // (a group of 32 or fewer has no other half to exchange with)
+                        // `VICTORY_WAVE_WHY=1`: where the mask is written, and
+                        // whether the program's own lanes are all of it there.
+                        // A mask that is the lanes that run needs no exchange
+                        // (each host wave's ballot is all 32 bits), so this is
+                        // what a form that takes it anyway has to widen.
+                        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                            eprintln!(
+                                "MASK-EXCHANGE {:#x}: mask written in block {b:?}, active {}",
+                                inst.machine.offset,
+                                self.x.st.active.contains(&lo)
+                            );
+                        }
                         need(b.unwrap_or(0));
                         return Err("a lane mask exchanged where not every lane runs");
                     }
