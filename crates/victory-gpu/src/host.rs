@@ -5748,6 +5748,9 @@ pub(crate) static DIRECT_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atom
 /// Bytes [`write_mapped`] wrote directly into title memory since the last
 /// frame line.
 pub(crate) static DIRECT_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Reads a frame that were too long to ask about, and so went the kernel's
+/// way without being asked (see [`direct_read`]).
+pub(crate) static DIRECT_TOO_LONG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 thread_local! {
     /// Set while this thread holds title memory's read side for a direct
@@ -5786,7 +5789,7 @@ impl Drop for Reading {
 }
 
 /// Reads title memory at `src` into `dst` (`len` bytes) by copying it
-/// directly, as `memcpy` would, when every page of it is there; false
+/// directly, as `memcpy` would, when every page of it can be read; false
 /// otherwise (the caller takes the kernel's way).
 ///
 /// The memory is this process's own (the runtime's `XMemVirtualAlloc`
@@ -5795,22 +5798,21 @@ impl Drop for Reading {
 /// frame line's "copies" was 201.6 MB in 3627 ms a frame, 55 MB/s, where a
 /// `memcpy` of the same pages runs at 10-20 GB/s.
 ///
-/// What makes it safe is asking the pages first, in batches of 256, as
-/// `crate::texture::readable` does: a page not in the working set is not
-/// touched and the whole read goes the kernel's way, which is also what
-/// happens to a page the title gives up between the question and the copy
-/// (the answer can be stale, and a stale "there" faults: so the pages are
-/// asked, and the copy still goes the kernel's way if the title is in the
-/// middle of a remap, [`crate::watch::title_memory_reading_now`]).
+/// The question asked is `crate::texture::committed`, the same one a direct
+/// write asks of its destination and for the same reason: it is what works
+/// under Wine. `K32QueryWorkingSetEx` alone answers a different question —
+/// bit 0 says whether the page is in the *working set*, and a page that is
+/// committed and has never been touched is not, though reading it is
+/// perfectly safe. A cold title buffer is mostly such pages, so asking only
+/// that sent every read back to the kernel: 2,745 refusals a frame and
+/// 0.0 MB copied, with the writes, whose pages had just been written, at
+/// 50.6 MB. `committed` asks a byte through the kernel where the working
+/// set does not know, which both answers the question and warms the page.
 fn direct_read(src: *const u8, dst: *mut u8, len: usize) -> bool {
-    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    const PAGE: usize = 4096;
     if len == 0 {
         return true;
     }
-    // A read of title memory in place must not cross a remap; the kernel's
-    // way is the fallback while one is under way.
+    // A read of title memory in place must not cross a remap.
     //
     // A caller may already hold the read side (`crate::texture`'s refresh
     // reads title memory in place and takes it; that read does not go
@@ -5820,39 +5822,25 @@ fn direct_read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     let Some(_reading) = Reading::take() else {
         return false;
     };
-    // (a source that starts inside a page is asked for from that page's
-    // start: the pages the read touches, and no others)
-    let first = src as usize / PAGE;
-    let pages = ((src as usize % PAGE).saturating_add(len)).div_ceil(PAGE);
-    // SAFETY: plain data.
-    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
-    let mut done = 0;
-    while done < pages {
-        let n = (pages - done).min(info.len());
-        for (i, entry) in info[..n].iter_mut().enumerate() {
-            entry.VirtualAddress = ((first + done + i) * PAGE) as *mut _;
-        }
-        // SAFETY: `n` entries of the size given; our own process.
-        let asked = unsafe {
-            K32QueryWorkingSetEx(
-                GetCurrentProcess(),
-                info.as_mut_ptr().cast(),
-                (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
-            )
-        } != 0;
-        if !asked {
-            return false;
-        }
-        for entry in info[..n].iter() {
-            // Bit 0 of the answer: the page is in the working set.
-            // SAFETY: plain data the query filled in.
-            if unsafe { entry.VirtualAttributes.Flags } & 1 == 0 {
-                return false;
-            }
-        }
-        done += n;
+    // The asking costs a page-table walk in batches, and one byte through
+    // the kernel for each page the working set does not know. On a cold run
+    // of 1.5 MB that is 384 syscalls to save one, so a run longer than
+    // `ASK_LIMIT` is not asked about at all: it takes the kernel's way,
+    // which is one call. Most runs are far shorter — the copies read
+    // 83-201 MB in 2,700 calls a frame, 30-75 KiB each.
+    //
+    // (Not sampled: a page in the middle that is gone would fault the copy,
+    // and a fault in memcpy is the process's.)
+    const ASK_LIMIT: usize = 256 << 10;
+    if len > ASK_LIMIT {
+        DIRECT_TOO_LONG.fetch_add(1, Ordering::Relaxed);
+        return false;
     }
-    // SAFETY: every page of the source was found present; the destination
+    if !crate::texture::committed(src, len) {
+        DIRECT_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    // SAFETY: every page of the source was found readable; the destination
     // is the caller's mapped host memory, and the ranges do not overlap.
     unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
     DIRECT_BYTES.fetch_add(len as u64, Ordering::Relaxed);
@@ -5905,13 +5893,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = if !title_dst && direct_reads() {
-        if direct_read(src, dst, len) {
-            true
-        } else {
-            DIRECT_REFUSED.fetch_add(1, Ordering::Relaxed);
-            read(src, dst, len)
-        }
+    let whole = if !title_dst && direct_reads() && direct_read(src, dst, len) {
+        true
     } else {
         read(src, dst, len)
     };
@@ -6271,11 +6254,13 @@ impl Meter {
             let read = DIRECT_BYTES.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
             let wrote = DIRECT_WRITES.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
             let refused = DIRECT_REFUSED.swap(0, Ordering::Relaxed) as f64 / frames;
-            if read > 0.0 || wrote > 0.0 || refused > 0.0 {
+            let long = DIRECT_TOO_LONG.swap(0, Ordering::Relaxed) as f64 / frames;
+            if read > 0.0 || wrote > 0.0 || refused > 0.0 || long > 0.0 {
                 tracing::info!(
                     "  copied without the kernel, per frame: {read:.1} MB read into host memory and {wrote:.1} MB \
                      written into title memory as `memcpy` (VICTORY_DIRECT_READ=0 keeps the kernel's way); \
-                     {refused:.0} reads a frame left to the kernel (a page was not there)"
+                     {refused:.0} reads a frame left to the kernel (a page could not be read), {long:.0} were \
+                     over 256 KiB and were not asked about"
                 );
             }
         }
@@ -6427,7 +6412,7 @@ impl Meter {
                          merge between them {:.1} ms (VICTORY_COPYBACK_SMALL=1 joins runs under 4 KiB, \
                          VICTORY_COPYBACK_GAP bytes takes any gap)",
                         runs as f64 / frames,
-                        bytes(per_run),
+                        per_run,
                         card[card_stat::READS] as f64 / frames,
                         writes as f64 / frames,
                         if calls > 0 { kernel_us / 1e3 / calls as f64 } else { 0.0 },
