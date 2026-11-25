@@ -2069,31 +2069,31 @@ fn wide_hand_back() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_HAND_BACK").is_none_or(|v| v != "0"))
 }
 
-/// `runs` (a span of the work, the copy, its own data) in a few groups
-/// for [`crate::shadow::wide_run`], a copy whole in one group: a copy's
-/// runs share its snapshot's lock, so two threads taking them would wait
-/// on each other rather than on the kernel. The groups take turns, the
-/// biggest copies first, so that each gets a share of the kernel calls.
-fn runs_by_copy<T: Send + 'static>(
-    runs: Vec<(usize, std::sync::Arc<crate::shadow::Shadow>, T)>,
-    groups: usize,
-) -> Vec<Vec<(usize, std::sync::Arc<crate::shadow::Shadow>, T)>> {
-    let mut copies: Vec<(usize, Vec<(usize, std::sync::Arc<crate::shadow::Shadow>, T)>)> = Vec::new();
-    for (span, shadow, data) in runs {
-        let key = std::sync::Arc::as_ptr(&shadow) as usize;
+/// A run of copy-back work: which span of the submission's work it comes
+/// from, the copy, the offset in the copy, and its bytes.
+type BackRun = (usize, std::sync::Arc<crate::shadow::Shadow>, usize, usize);
+
+/// `runs` in a few groups for [`crate::shadow::wide_run`], a copy whole in
+/// one group: a copy's runs share its snapshot's lock, so two threads
+/// taking them would wait on each other rather than on the kernel. The
+/// group least loaded takes each copy, the biggest copies first, so that
+/// each thread gets a share of the kernel calls.
+fn runs_by_copy(runs: Vec<BackRun>, groups: usize) -> Vec<Vec<BackRun>> {
+    let mut copies: Vec<(usize, Vec<BackRun>)> = Vec::new();
+    for run in runs {
+        let key = std::sync::Arc::as_ptr(&run.1) as usize;
         match copies.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, group)) => group.push((span, shadow, data)),
-            None => copies.push((key, vec![(span, shadow, data)])),
+            Some((_, group)) => group.push(run),
+            None => copies.push((key, vec![run])),
         }
     }
     // The copies with the most runs first: they are the ones worth spreading.
     copies.sort_by_key(|(_, group)| std::cmp::Reverse(group.len()));
     let groups = groups.clamp(1, copies.len().max(1));
-    let mut out: Vec<Vec<(usize, std::sync::Arc<crate::shadow::Shadow>, T)>> = (0..groups).map(|_| Vec::new()).collect();
+    let mut out: Vec<Vec<BackRun>> = (0..groups).map(|_| Vec::new()).collect();
     let mut loads = vec![0usize; groups];
     for (_, group) in copies {
         let n = group.len();
-        // The least loaded group takes it.
         let mut at = 0;
         for (i, &load) in loads.iter().enumerate() {
             if load < loads[at] {
@@ -2110,7 +2110,7 @@ fn runs_by_copy<T: Send + 'static>(
 /// Runs [`crate::shadow::Shadow::copy_back_run`] for each of `runs` (which
 /// span of the work, the copy, offset, bytes), on several threads with
 /// [`wide_hand_back`]; returns the bytes written, per span.
-fn merge_runs(runs: Vec<(usize, std::sync::Arc<crate::shadow::Shadow>, usize, usize)>, spans: usize) -> Vec<usize> {
+fn merge_runs(runs: Vec<BackRun>, spans: usize) -> Vec<usize> {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     let written: std::sync::Arc<Vec<AtomicUsize>> = std::sync::Arc::new((0..spans).map(|_| AtomicUsize::new(0)).collect());
     let runs_len = runs.len();
@@ -2568,7 +2568,7 @@ fn relay_hand_back(back: &[Declared]) {
     crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
     // Merge adjacent pieces: one kernel read/write per run, not per 64 KiB
     // piece (see `Shadow::copy_back_with`).
-    let merged: Vec<(usize, std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = work
+    let merged: Vec<BackRun> = work
         .iter()
         .enumerate()
         .zip(found)
@@ -2864,7 +2864,7 @@ fn hand_back(back: &[Declared]) {
         // thread that settles. The runs of one copy touch its own bytes of
         // title memory and of the copy, no two the same, and a copy's
         // snapshot is only read (its lock is taken per run).
-        let runs: Vec<(usize, std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = work
+        let runs: Vec<BackRun> = work
             .iter()
             .enumerate()
             .zip(found)
@@ -3537,6 +3537,8 @@ impl Host {
         // pieces a heavy frame, a kernel read and maybe a write each.
         let written = {
             use std::sync::atomic::AtomicUsize;
+            // The mapping's address (`data` borrows the work's slot).
+            let fetched = *data;
             let written = std::sync::Arc::new(AtomicUsize::new(0));
             let each = pieces.len().div_ceil(8).max(4);
             let jobs: Vec<crate::shadow::Job> = if wide_hand_back() && pieces.len() >= 2 {
@@ -3551,7 +3553,7 @@ impl Host {
                             for (shadow, lo, hi, at) in chunk {
                                 // SAFETY: the mapping of the fetched bytes,
                                 // `total` of them; the copy into it has run.
-                                let gpu = unsafe { std::slice::from_raw_parts((data + at as usize) as *const u8, hi - lo) };
+                                let gpu = unsafe { std::slice::from_raw_parts((fetched + at as usize) as *const u8, hi - lo) };
                                 sum += shadow.card_merge_relay(lo, gpu, after, &mut title);
                             }
                             written.fetch_add(sum, Ordering::Relaxed);
@@ -3566,7 +3568,7 @@ impl Host {
                     let mut sum = 0;
                     for (shadow, lo, hi, at) in pieces {
                         // SAFETY: as above.
-                        let gpu = unsafe { std::slice::from_raw_parts((data + at as usize) as *const u8, hi - lo) };
+                        let gpu = unsafe { std::slice::from_raw_parts((fetched + at as usize) as *const u8, hi - lo) };
                         sum += shadow.card_merge_relay(lo, gpu, after, &mut title);
                     }
                     written.fetch_add(sum, Ordering::Relaxed);
