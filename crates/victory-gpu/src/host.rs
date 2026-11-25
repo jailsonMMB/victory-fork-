@@ -2604,7 +2604,10 @@ fn relay_hand_back(back: &[Declared]) {
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
     // Merge adjacent pieces: one kernel read/write per run, not per 64 KiB
-    // piece (see `Shadow::copy_back_with`).
+    // piece (see `Shadow::copy_back_with`). Short runs are joined to their
+    // neighbours too, with `VICTORY_COPYBACK_SMALL=1`: a run costs what a
+    // 64 KiB one does, whatever its size.
+    let short = crate::shadow::merge_small_runs();
     let merged: Vec<BackRun> = work
         .iter()
         .enumerate()
@@ -2616,6 +2619,9 @@ fn relay_hand_back(back: &[Declared]) {
                     Some(last) if last.0 + last.1 == at => last.1 += n,
                     _ => merged.push((at, n)),
                 }
+            }
+            if short {
+                merged = crate::shadow::merge_short_runs(merged);
             }
             merged.into_iter().map(move |(at, n)| (span, shadow.clone(), at, n))
         })
@@ -2630,6 +2636,13 @@ fn relay_hand_back(back: &[Declared]) {
             .map(|_| std::sync::atomic::AtomicUsize::new(0))
             .collect(),
     );
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::BackPieces, merged.len() as u64);
+        add(C::BackJobs, merged.len() as u64);
+        add(C::BackBatches, 1);
+    }
     let groups = if wide_hand_back() { merged.len().div_ceil(4).min(8) } else { 1 };
     let jobs: Vec<crate::shadow::Job> = runs_by_copy(merged, groups)
         .into_iter()
@@ -2916,6 +2929,13 @@ fn hand_back(back: &[Declared]) {
                 merged.into_iter().map(move |(at, n)| (span, shadow.clone(), at, n))
             })
             .collect();
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::BackPieces, runs.len() as u64);
+            add(C::BackJobs, runs.len() as u64);
+            add(C::BackBatches, 1);
+        }
         let written = merge_runs(runs, work.len());
         for ((_, _from, _to), written) in work.iter().zip(written) {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);

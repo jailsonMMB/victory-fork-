@@ -127,8 +127,21 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// What copy-back's time goes to: the pieces found to differ, the runs
+    /// they merge into, how many of those runs had to be put into title
+    /// memory at all, the kernel's reads and writes (count and time), and
+    /// the byte-by-byte merge in between.
+    BackPieces,
+    BackRuns,
+    BackLanded,
+    BackKernelCalls,
+    BackKernelUs,
+    BackMergeUs,
+    /// Merges given to one `wide` call at once, and the calls.
+    BackJobs,
+    BackBatches,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 88;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1187,6 +1200,25 @@ pub(crate) fn log(frames: f64) {
         longest.0 as f64 / 1e3,
         longest.1
     );
+    // Where copy-back's time goes: it is the frame's largest cost on a card
+    // with copies of its own, and the numbers say whether it is the kernel
+    // (a read and a write a run) or the merge between them.
+    if c[C::BackRuns as usize] > 0 {
+        let runs = c[C::BackRuns as usize];
+        let landed = c[C::BackLanded as usize];
+        let calls = c[C::BackKernelCalls as usize];
+        tracing::info!(
+            "  what shaders wrote, put back per frame: {:.0} runs merged from the pieces that differ, {:.0} of them \
+             with a byte to write into title memory; the kernel was called {:.0} times for {:.1} ms ({:.2} ms a call), \
+             the byte merge in between took {:.1} ms (VICTORY_COPYBACK_SMALL=1 merges under 4 KiB in title memory)",
+            runs as f64 / frames,
+            landed as f64 / frames,
+            calls as f64 / frames,
+            ms(c[C::BackKernelUs as usize]),
+            if calls > 0 { ms(c[C::BackKernelUs as usize]) / (calls as f64) } else { 0.0 },
+            ms(c[C::BackMergeUs as usize]),
+        );
+    }
     let by = WAITS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut by: Vec<_> = by.into_iter().flatten().collect();
     by.sort_by_key(|&(_, (_, us))| std::cmp::Reverse(us));

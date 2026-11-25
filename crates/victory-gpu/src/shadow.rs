@@ -1052,6 +1052,49 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 /// About this many bytes to a piece of work for [`wide`].
 const WIDE_JOB: usize = 1 << 20;
 
+/// `VICTORY_COPYBACK_SMALL=1`: runs shorter than [`SMALL_RUN`] are merged
+/// with the runs around them before title memory is touched.
+///
+/// Every run costs a kernel read of title memory, a kernel write into it,
+/// and the journal's note of the write — some 2 ms on Wine/vkd3d whatever
+/// the run's size (hundreds of runs at ~2 ms were seconds a frame). A run
+/// of a few bytes (a shader setting a counter) then costs as much as a
+/// 64 KiB piece, and the few hundred runs a heavy frame come out to the
+/// frame's largest cost. Between two such runs the bytes in between are
+/// read and written too, and the loop below puts title memory's own bytes
+/// back wherever the copy did not change, so nothing there is lost; what
+/// it costs is the read and the write of a few KiB.
+///
+/// Off by default: the extra bytes reach title memory and the title's
+/// write-watch, which is a thing to measure before it is relied on.
+pub(crate) fn merge_small_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPYBACK_SMALL").is_some_and(|v| v == "1"))
+}
+
+/// Runs shorter than this are merged with their neighbours under
+/// [`merge_small_runs`].
+const SMALL_RUN: usize = 4 << 10;
+
+/// `runs` (offsets into a copy, in order, disjoint) with every run shorter
+/// than [`SMALL_RUN`] joined to the run before it: the bytes between them
+/// go to title memory as it has them (`copy_back_run_with` writes the
+/// copy's bytes only where the GPU changed them, and the title's
+/// elsewhere), so the run is right, only wider.
+pub(crate) fn merge_short_runs(runs: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for (at, n) in runs {
+        match out.last_mut() {
+            // (adjacent or a short run either side of the gap)
+            Some(last) if last.0 + last.1 == at || n < SMALL_RUN || last.1 < SMALL_RUN => {
+                last.1 = at + n - last.0;
+            }
+            _ => out.push((at, n)),
+        }
+    }
+    out
+}
+
 /// With [`wide_back`]: the snapshots noted while a submission is prepared
 /// (from, to, bytes), taken by [`take_snapshots`].
 static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
@@ -1926,14 +1969,24 @@ impl Shadow {
         let (at, n) = (at + first, last + 1 - first);
         let (host, old) = (&mut host[first..=last], &old[first..=last]);
         let mut title = vec![0u8; n];
+        #[cfg(feature = "diagnostics")]
+        let kernel = std::time::Instant::now();
         if !crate::host::read_into((start + at) as *const u8, &mut title) {
             return 0;
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::BackKernelCalls, 1);
+            add(C::BackKernelUs, kernel.elapsed().as_micros() as u64);
         }
         // Title memory with the GPU's bytes put in; the copy takes the
         // title's bytes in turn. Without a branch, so the loop runs many
         // bytes at a time: the GPU's byte where the copy's byte is not what
         // it was before the submission, else the title's. (With the two
         // searches above this was 44 ms a frame for 970 pieces.)
+        #[cfg(feature = "diagnostics")]
+        let merging = std::time::Instant::now();
         let mut differs = 0u8;
         for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
             let gpu = if *h != *o { 0xffu8 } else { 0 };
@@ -1942,11 +1995,28 @@ impl Shadow {
             *t = merged;
             *h = merged;
         }
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::BackMergeUs, merging.elapsed().as_micros() as u64);
+            add(C::BackRuns, 1);
+        }
         if differs == 0 {
             return 0;
         }
+        // The kernel's write of title memory: this is the time that a piece
+        // landing in title memory costs, and most runs cost it.
+        #[cfg(feature = "diagnostics")]
+        let writing = std::time::Instant::now();
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::BackLanded, 1);
+            add(C::BackKernelCalls, 1);
+            add(C::BackKernelUs, writing.elapsed().as_micros() as u64);
+        }
         n
     }
 
@@ -1988,6 +2058,12 @@ impl Shadow {
                     }
                 }
                 merged
+            };
+            // Short runs cost what long ones do (`merge_small_runs`).
+            let differing = if merge_small_runs() {
+                merge_short_runs(differing)
+            } else {
+                differing
             };
             #[cfg(feature = "diagnostics")]
             let syncing = {
@@ -3253,4 +3329,59 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod short_run_tests {
+    use super::{SMALL_RUN, merge_short_runs};
+
+    /// Every byte of a run is a byte of some run in the output, no byte of
+    /// the output lies outside the input's runs.
+    fn covers(input: &[(usize, usize)], output: &[(usize, usize)]) -> bool {
+        let mut want = vec![false; 1 << 20];
+        for &(at, n) in input {
+            want[at..at + n].fill(true);
+        }
+        let mut got = vec![false; 1 << 20];
+        for &(at, n) in output {
+            got[at..at + n].fill(true);
+        }
+        want == got
+    }
+
+    #[test]
+    fn short_runs_join_their_neighbours_and_long_ones_stay() {
+        let long = SMALL_RUN * 2;
+        // two tiny runs (a shader setting a counter) far apart, and one long
+        let input = vec![(0x100, 4), (0x1000, 8), (0x8000, long), (0x20000, 4)];
+        let out = merge_short_runs(input.clone());
+        assert!(covers(&input, &out), "the merged runs cover exactly the input's: {out:?}");
+        assert!(out.iter().all(|&(at, n)| n >= SMALL_RUN || at == 0x8000), "every short run joined: {out:?}");
+        assert!(out.len() < input.len(), "fewer runs than in: {out:?}");
+    }
+
+    #[test]
+    fn adjacent_runs_still_join_and_order_is_kept() {
+        let input = vec![(0, 16), (16, 32), (64, 8)];
+        let out = merge_short_runs(input.clone());
+        assert!(covers(&input, &out));
+        assert!(out.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0), "in order, disjoint: {out:?}");
+    }
+
+    #[test]
+    fn a_short_run_joins_the_one_before_it() {
+        // A short run between two long ones goes to the first: the gap
+        // between them is written with the title's own bytes.
+        let input = vec![(0, SMALL_RUN * 2), (SMALL_RUN * 4, 4), (SMALL_RUN * 8, SMALL_RUN * 2)];
+        let out = merge_short_runs(input.clone());
+        assert!(covers(&input, &out));
+        assert_eq!(out, vec![(0, SMALL_RUN * 4 + 4), (SMALL_RUN * 8, SMALL_RUN * 2)]);
+    }
+
+    #[test]
+    fn long_runs_apart_stay_apart() {
+        let input = vec![(0, SMALL_RUN * 2), (SMALL_RUN * 8, SMALL_RUN * 2)];
+        let out = merge_short_runs(input.clone());
+        assert_eq!(out, input);
+    }
 }
