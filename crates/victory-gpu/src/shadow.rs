@@ -2779,6 +2779,10 @@ impl Shadow {
                 let writing = std::time::Instant::now();
                 crate::watch::writing(start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                // (`write_mapped` asks whether the pages are there before it
+                // copies directly, and `ASKING_US` counts that asking apart,
+                // so a run's time here is the copy and the asking together;
+                // the line says which of the two the frame spent.)
                 CARD_STATS[card_stat::WRITE_US].fetch_add(writing.elapsed().as_micros() as u64, Ordering::Relaxed);
                 CARD_STATS[card_stat::WRITES].fetch_add(1, Ordering::Relaxed);
                 written = n;

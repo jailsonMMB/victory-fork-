@@ -5464,7 +5464,12 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_copy(dst, len);
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    // Both sides are title memory here (`Step::Copy` is the
+                    // runtime's copy from one place of its memory to
+                    // another).
+                    if !copy_title_to_title(dst as *mut u8, src as *const u8, len) {
+                        copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    }
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     len
@@ -5751,6 +5756,14 @@ pub(crate) static DIRECT_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomi
 /// Reads a frame that were too long to ask about, and so went the kernel's
 /// way without being asked (see [`direct_read`]).
 pub(crate) static DIRECT_TOO_LONG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Microseconds spent asking [`crate::texture::committed`] whether a copy's
+/// pages are there, since the last frame line. The probes it makes are
+/// kernel calls of their own; they are counted apart from the copying so
+/// that "a call's cost" means the copy and not the asking.
+pub(crate) static ASKING_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Bytes copied straight from title memory into title memory since the last
+/// frame line (counted in [`DIRECT_BYTES`] as well).
+pub(crate) static DIRECT_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 thread_local! {
     /// Set while this thread holds title memory's read side for a direct
@@ -5836,7 +5849,10 @@ fn direct_read(src: *const u8, dst: *mut u8, len: usize) -> bool {
         DIRECT_TOO_LONG.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    if !crate::texture::committed(src, len) {
+    let asked = std::time::Instant::now();
+    let there = crate::texture::committed(src, len);
+    ASKING_US.fetch_add(asked.elapsed().as_micros() as u64, Ordering::Relaxed);
+    if !there {
         DIRECT_REFUSED.fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -5844,6 +5860,48 @@ fn direct_read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     // is the caller's mapped host memory, and the ranges do not overlap.
     unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
     DIRECT_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+    true
+}
+
+/// The most bytes a copy of title memory into title memory is asked about
+/// before it is copied directly (see [`copy_title_to_title`]): beyond this
+/// the two questions cost more than the one kernel call they would save.
+const TITLE_COPY_ASK: usize = 1 << 20;
+
+/// Whether `[dst, dst+len)` and `[src, src+len)` are both readable: the
+/// same question a direct read asks (`crate::texture::committed`, a batched
+/// working-set query and a one-byte probe where that cannot say), of both
+/// sides.
+fn both_readable(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    if len == 0 || len > TITLE_COPY_ASK {
+        return false;
+    }
+    let asked = std::time::Instant::now();
+    let both = crate::texture::committed(src, len) && crate::texture::committed(dst, len);
+    ASKING_US.fetch_add(asked.elapsed().as_micros() as u64, Ordering::Relaxed);
+    both
+}
+
+/// A copy from title memory into title memory, both sides this process's
+/// own bytes: a plain copy when both are readable, `false` when the caller
+/// must take the kernel's way (a page of either side is not there).
+///
+/// This is where the `copies` line's bytes went. A `Step::Copy` is the
+/// runtime's own copy from one place of its memory to another, so its
+/// destination is title memory; `copy_mapped` was called with `title_dst`,
+/// which no direct way covered, so every one of these went through the
+/// wineserver. The line read 102-161 MB a frame while the direct read saw
+/// 0.2-11 MB of it, and the largest single cost of the frame was two ranges
+/// of our own address space being moved by a syscall.
+pub(crate) fn copy_title_to_title(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    if !direct_reads() || !both_readable(dst, src, len) {
+        return false;
+    }
+    // SAFETY: both sides were found readable and are this process's own
+    // memory; the runtime's copies are between distinct allocations.
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+    DIRECT_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+    DIRECT_COPIES.fetch_add(len as u64, Ordering::Relaxed);
     true
 }
 
@@ -6255,12 +6313,15 @@ impl Meter {
             let wrote = DIRECT_WRITES.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
             let refused = DIRECT_REFUSED.swap(0, Ordering::Relaxed) as f64 / frames;
             let long = DIRECT_TOO_LONG.swap(0, Ordering::Relaxed) as f64 / frames;
-            if read > 0.0 || wrote > 0.0 || refused > 0.0 || long > 0.0 {
+            let ask = ASKING_US.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+            let title = DIRECT_COPIES.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
+            if read > 0.0 || wrote > 0.0 || refused > 0.0 || long > 0.0 || title > 0.0 {
                 tracing::info!(
-                    "  copied without the kernel, per frame: {read:.1} MB read into host memory and {wrote:.1} MB \
-                     written into title memory as `memcpy` (VICTORY_DIRECT_READ=0 keeps the kernel's way); \
-                     {refused:.0} reads a frame left to the kernel (a page could not be read), {long:.0} were \
-                     over 256 KiB and were not asked about"
+                    "  copied without the kernel, per frame: {read:.1} MB read into host memory ({title:.1} MB of it \
+                     title memory into title memory) and {wrote:.1} MB written into title memory, as `memcpy` \
+                     (VICTORY_DIRECT_READ=0 keeps the kernel's way); {ask:.1} ms asking whether the pages were \
+                     there; {refused:.0} reads a frame left to the kernel (a page could not be read), {long:.0} were \
+                     over the most that is asked about"
                 );
             }
         }
