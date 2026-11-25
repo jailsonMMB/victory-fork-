@@ -46,7 +46,7 @@
 //! 16,352 of 16,384 pages read zeros with the handle closed, none with it
 //! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
@@ -66,7 +66,7 @@ pub fn use_pipeline_cache(dir: PathBuf) {
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
-/// Hits and misses of the process-local PSO cache, and successful early PSOs.
+/// Hits and misses of the process-local host-pipeline cache, and successful early PSOs.
 pub(crate) static MEMORY_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static MEMORY_MISSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WARMED: AtomicU64 = AtomicU64::new(0);
@@ -413,29 +413,6 @@ unsafe impl Send for Library {}
 // SAFETY: as above; the other fields are an atomic and a lock.
 unsafe impl Sync for Library {}
 
-/// A D3D12 PSO is free-threaded, so the worker-made object may be shared
-/// with another pipeline request through the process-local cache.
-struct CachedPipeline(ID3D12PipelineState);
-
-// SAFETY: D3D12 pipeline state objects are free-threaded COM objects.
-unsafe impl Send for CachedPipeline {}
-
-/// Process-local PSOs remain usable even when the driver rejects D3D12
-/// pipeline libraries. Names use the same descriptor hash as the persistent
-/// library, so equal host pipelines share one COM object.
-static MEMORY: OnceLock<Mutex<HashMap<String, CachedPipeline>>> = OnceLock::new();
-
-fn memory() -> std::sync::MutexGuard<'static, HashMap<String, CachedPipeline>> {
-    MEMORY
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-}
-
-fn remember(name: &str, pipeline: &ID3D12PipelineState) {
-    memory().insert(name.to_owned(), CachedPipeline(pipeline.clone()));
-}
-
 /// Held by a load of the pipeline named `name`: loads of the same name
 /// wait for each other (the host's one exception to the library's thread
 /// safety: such a load may change that pipeline's entry). Names share 64
@@ -541,76 +518,58 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
-/// The pipeline named `name`: use the process-local cache first, then the
-/// persistent library where supported, and compile/store on a miss.
+/// The pipeline named `name`: load it from the persistent library where
+/// supported, else compile it; the owning host pipeline is cached by key in
+/// `pipeline::make` for this process.
 pub(crate) fn pipeline(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
-    let _same = same_name(name);
-    if let Some(pipeline) = memory().get(name).map(|cached| cached.0.clone()) {
-        MEMORY_HITS.fetch_add(1, Ordering::Relaxed);
-        return Ok(pipeline);
-    }
-    MEMORY_MISSES.fetch_add(1, Ordering::Relaxed);
-
-    let library = library();
-    let began = std::time::Instant::now();
-    let refused = if let Some(library) = library {
-        let wide = HSTRING::from(name);
-        let loaded = {
-            let _all = one_call();
-            let _call = call("load", name);
-            load(&library.library, PCWSTR(wide.as_ptr()))
-        };
-        LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
-        TRIMMED.store(false, Ordering::Relaxed);
-        match loaded {
-            Ok(pipeline) => {
-                LOADED.fetch_add(1, Ordering::Relaxed);
-                remember(name, &pipeline);
-                crate::host::trail(|| {
-                    let label = LABEL.with(|l| l.borrow().clone());
-                    format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
-                });
-                return Ok(pipeline);
-            }
-            Err(error) => Some(error),
-        }
-    } else {
-        None
+    let Some(library) = library() else {
+        MADE.fetch_add(1, Ordering::Relaxed);
+        return create();
     };
-
+    let wide = HSTRING::from(name);
+    let began = std::time::Instant::now();
+    let loaded = {
+        let _all = one_call();
+        let _one = same_name(name);
+        let _call = call("load", name);
+        load(&library.library, PCWSTR(wide.as_ptr()))
+    };
+    LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
+    TRIMMED.store(false, Ordering::Relaxed);
+    let refused = match loaded {
+        Ok(pipeline) => {
+            LOADED.fetch_add(1, Ordering::Relaxed);
+            crate::host::trail(|| {
+                let label = LABEL.with(|l| l.borrow().clone());
+                format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
+            });
+            return Ok(pipeline);
+        }
+        Err(error) => error,
+    };
     let pipeline = {
         let _call = call("make", name);
         create()?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
-    remember(name, &pipeline);
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
-        match refused {
-            Some(error) => format!(
-                "pipeline library: made {label} in {:.1} ms (load refused: {error})",
-                began.elapsed().as_secs_f64() * 1e3
-            ),
-            None => format!(
-                "pipeline cache: made {label} in {:.1} ms (using process-local PSO cache)",
-                began.elapsed().as_secs_f64() * 1e3
-            ),
-        }
+        format!(
+            "pipeline library: made {label} in {:.1} ms (load refused: {refused})",
+            began.elapsed().as_secs_f64() * 1e3
+        )
     });
-    if let Some(library) = library {
-        let wide = HSTRING::from(name);
-        let _all = one_call();
-        let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
-        let _call = call("store", name);
-        // SAFETY: a live pipeline; a name already stored (a description
-        // that differs) is refused, which leaves the library as it was.
-        if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pipeline) }.is_ok() {
-            library.added.fetch_add(1, Ordering::Relaxed);
-        }
+    let _all = one_call();
+    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+    let _call = call("store", name);
+    // SAFETY: a live pipeline; a name already stored (a description that
+    // differs) is refused, which leaves the library as it was.
+    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pipeline) }.is_ok() {
+        library.added.fetch_add(1, Ordering::Relaxed);
     }
     Ok(pipeline)
 }
