@@ -3116,10 +3116,18 @@ impl<'a> Lower<'a> {
                         // A mask that is the lanes that run needs no exchange
                         // (each host wave's ballot is all 32 bits), so this is
                         // what a form that takes it anyway has to widen.
-                        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                        if std::env::var_os("VICTORY_WAVE_WHY").is_some()
+                            && let Some(b) = b
+                        {
+                            // (this block writes the mask: its writing
+                            // instruction's offset, for the log)
+                            let at = self.x.p.blocks[b]
+                                .insts
+                                .iter()
+                                .find(|i| i.writes.iter().any(|w| w.1 == lo))
+                                .map_or(0, |i| i.machine.offset);
                             eprintln!(
-                                "MASK-EXCHANGE {:#x}: mask written in block {b:?}, active {}",
-                                inst.machine.offset,
+                                "MASK-EXCHANGE {at:#x}: mask written in block {b}, active {}",
                                 self.x.st.active.contains(&lo)
                             );
                         }
