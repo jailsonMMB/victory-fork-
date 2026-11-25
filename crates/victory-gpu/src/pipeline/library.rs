@@ -438,23 +438,49 @@ const EARLY_FILE: &str = "early-pipelines.txt";
 const EARLY_MAX: usize = 8192;
 
 fn library() -> Option<&'static Library> {
-    static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
-    LIBRARY
-        .get_or_init(|| {
-            let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
-            let library = open(&device, blob);
-            if library.is_none() {
-                tracing::warn!("no host pipeline library: pipelines are not kept");
-            }
-            library
-        })
-        .as_ref()
+    // Do not cache an absence: the first pipeline can precede host-device
+    // initialization, and later attempts can retry after initialization.
+    static LIBRARY: OnceLock<Library> = OnceLock::new();
+    static INITIALIZING: Mutex<()> = Mutex::new(());
+    static RETRY_AFTER: AtomicU64 = AtomicU64::new(0);
+    if let Some(library) = LIBRARY.get() {
+        return Some(library);
+    }
+    let now = crate::host::now_ms();
+    if now < RETRY_AFTER.load(Ordering::Relaxed) {
+        return None;
+    }
+    let _initializing = INITIALIZING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(library) = LIBRARY.get() {
+        return Some(library);
+    }
+    let Some(host) = crate::host::host() else {
+        RETRY_AFTER.store(now.saturating_add(5_000), Ordering::Relaxed);
+        return None;
+    };
+    // Host pipeline creation already uses ID3D12Device2. Query the same
+    // interface here; it inherits ID3D12Device1's CreatePipelineLibrary.
+    let device = match host.device.cast::<ID3D12Device2>() {
+        Ok(device) => device,
+        Err(error) => {
+            RETRY_AFTER.store(now.saturating_add(5_000), Ordering::Relaxed);
+            tracing::warn!(error = %error, "host device does not expose ID3D12Device2::CreatePipelineLibrary");
+            return None;
+        }
+    };
+    let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
+    let Some(library) = open(&device, blob) else {
+        RETRY_AFTER.store(now.saturating_add(5_000), Ordering::Relaxed);
+        tracing::warn!("CreatePipelineLibrary failed; will retry");
+        return None;
+    };
+    let _ = LIBRARY.set(library);
+    LIBRARY.get()
 }
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
-fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
+fn open(device: &ID3D12Device2, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
@@ -728,7 +754,7 @@ mod tests {
 
     #[test]
     fn a_rejected_blob_gives_an_empty_library() {
-        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device2>().ok()) else {
             return; // no host GPU here
         };
         let library = open(&device, Blob::Held(b"not a pipeline library".repeat(16))).expect("an empty library");
