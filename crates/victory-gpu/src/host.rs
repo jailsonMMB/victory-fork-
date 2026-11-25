@@ -6407,6 +6407,12 @@ impl Meter {
                 breakdown[10] / 1e3, breakdown[11]
             );
         }
+        let (kernel_asks, kernel_ask_us) = crate::watch::take_kernel_stats();
+        tracing::info!(
+            "GetWriteWatch kernel calls per frame: {:.1}, time {:.1} ms",
+            kernel_asks as f64 / frames,
+            kernel_ask_us as f64 / 1e3 / frames
+        );
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });

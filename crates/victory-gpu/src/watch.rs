@@ -57,6 +57,19 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     kept: false,
 });
 
+/// Actual GetWriteWatch kernel calls and their elapsed microseconds, including
+/// both ahead asks and per-range fallback asks (release telemetry).
+static KERNEL_ASKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static KERNEL_ASK_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn take_kernel_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        KERNEL_ASKS.swap(0, Relaxed),
+        KERNEL_ASK_US.swap(0, Relaxed),
+    )
+}
+
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
@@ -181,19 +194,36 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         j.asked += 1;
         j.ahead_asked = j.asked;
     }
-    // `ask_ahead` leaves a range that lies alone to `writes`, which asks
-    // once per flush: with one asking for the submission that was every
-    // such range asked again at each of its 70 flushes (run 76: 2,300
-    // askings a frame with the switch on, as without it). They are asked
-    // here, once; what is not write-watched stays with `writes`.
-    for &(start, end) in ranges {
-        if start >= end {
-            continue;
+    // `ask_ahead` leaves isolated ranges to the later refreshes. Group
+    // those leftovers too: one write-watch query can cover nearby ranges
+    // of the same reservation, avoiding thousands of per-copy kernel calls.
+    let mut pending: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|&&(start, end)| start < end)
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .filter(|&(first, last)| !j.ahead.iter().any(|&(a, b)| a <= first && last <= b))
+        .collect();
+    pending.sort_unstable();
+    let mut i = 0;
+    while i < pending.len() {
+        let first = pending[i].0;
+        let mut last = pending[i].1;
+        let mut k = i + 1;
+        while k < pending.len()
+            && pending[k].0 <= last + AHEAD_GAP
+            && pending[k].1.max(last) - first <= AHEAD_MAX
+        {
+            last = last.max(pending[k].1);
+            k += 1;
         }
-        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
-            j.ahead.push((first, last));
+        if k - i == 1 {
+            if ask_kernel(j, first, last) {
+                j.ahead.push((first, last));
+            }
+        } else {
+            ask_run(j, &pending[i..k]);
         }
+        i = k;
     }
     j.kept = !j.ahead.is_empty();
 }
@@ -250,6 +280,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
+    let kernel_started = std::time::Instant::now();
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
@@ -263,6 +294,8 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
             &mut granularity,
         )
     } != 0;
+    KERNEL_ASKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    KERNEL_ASK_US.fetch_add(kernel_started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     if failed {
         return false;
     }
@@ -334,6 +367,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
+    let kernel_started = std::time::Instant::now();
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
@@ -347,6 +381,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             &mut granularity,
         )
     } != 0;
+    KERNEL_ASKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    KERNEL_ASK_US.fetch_add(kernel_started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     let guarded = if failed {
         count = 0;
         if !guarded {
