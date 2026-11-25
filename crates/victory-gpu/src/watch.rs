@@ -231,7 +231,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             if ask_kernel(j, first, last) {
                 j.ahead.push((first, last));
             } else {
-                j.unwatched.insert(first, last);
+                j.unwatched.insert((first, last));
             }
         } else {
             ask_run(j, &pending[i..k]);
@@ -280,7 +280,7 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
         return;
     }
     if pieces.len() == 1 {
-        j.unwatched.insert(first, last);
+        j.unwatched.insert((first, last));
         return;
     }
     let (a, b) = pieces.split_at(pieces.len() / 2);
@@ -418,7 +418,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             slow(started.elapsed().as_micros() as u64);
         }
         if failed {
-            j.unwatched.insert(first, last);
+            j.unwatched.insert((first, last));
         }
         failed
     };
