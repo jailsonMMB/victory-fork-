@@ -15,9 +15,9 @@
 //! The default budget is half a second per title frame. A pass the title
 //! runs only once and whose pipeline takes longer is lost.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Shader;
@@ -28,11 +28,12 @@ pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queue_state: AtomicU8,
-    made: OnceLock<Option<HostPipeline>>,
+    made: OnceLock<Option<Arc<HostPipeline>>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    prewarm: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -40,6 +41,39 @@ pub(crate) struct Pending {
 unsafe impl Send for Pending {}
 // SAFETY: as above.
 unsafe impl Sync for Pending {}
+
+/// An early or requested host pipeline can serve another title pipeline with
+/// the same cross-run key. D3D12 objects are free-threaded; the wrapper lets
+/// the cache share them through its mutex.
+struct CachedHost(Arc<HostPipeline>);
+
+// SAFETY: `HostPipeline` contains free-threaded D3D12 objects and immutable metadata.
+unsafe impl Send for CachedHost {}
+
+static HOST_CACHE: OnceLock<Mutex<HashMap<String, CachedHost>>> = OnceLock::new();
+
+fn cache_lock(key: &str) -> MutexGuard<'static, ()> {
+    static LOCKS: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
+    let at = key.bytes().fold(0usize, |hash, byte| hash.wrapping_mul(31).wrapping_add(usize::from(byte)));
+    LOCKS[at % LOCKS.len()].lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn cached(key: &str) -> Option<Arc<HostPipeline>> {
+    HOST_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .map(|pipeline| pipeline.0.clone())
+}
+
+fn remember(key: &str, pipeline: Arc<HostPipeline>) {
+    HOST_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key.to_owned(), CachedHost(pipeline));
+}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
@@ -56,12 +90,27 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            prewarm: AtomicBool::new(false),
         }
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        let _same = cache_lock(&self.key);
+        self.made.get_or_init(|| {
+            if let Some(pipeline) = cached(&self.key) {
+                super::library::MEMORY_HITS.fetch_add(1, Ordering::Relaxed);
+                return Some(pipeline);
+            }
+            super::library::MEMORY_MISSES.fetch_add(1, Ordering::Relaxed);
+            let pipeline = HostPipeline::new(&self.shaders, self.graphics.as_deref()).map(Arc::new)?;
+            remember(&self.key, pipeline.clone());
+            Some(pipeline)
+        });
+        if self.prewarm.swap(false, Ordering::Relaxed)
+            && self.made.get().is_some_and(|pipeline| pipeline.is_some())
+        {
+            super::library::WARMED.fetch_add(1, Ordering::Relaxed);
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -127,7 +176,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
-    p.made.get()?.as_ref()
+    p.made.get()?.as_ref().map(Arc::as_ref)
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -269,12 +318,18 @@ fn start(p: &Arc<Pending>, priority: u8) {
     }
     if !workers() {
         if p.queue_state.swap(MAKING, Ordering::Relaxed) == NOT_QUEUED {
+            if priority == EARLY {
+                p.prewarm.store(true, Ordering::Relaxed);
+            }
             p.make();
         }
         return;
     }
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
+        if priority == EARLY {
+            p.prewarm.store(true, Ordering::Relaxed);
+        }
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
@@ -333,12 +388,15 @@ static PEAK: AtomicU64 = AtomicU64::new(0);
 /// The workers ran out of work: logged after a batch of 10 or more, and
 /// the cache saved (at most every 20 s).
 fn drained() {
-    use super::library::{EARLY, LOADED, MADE};
+    use super::library::{EARLY, LOADED, MADE, MEMORY_HITS, MEMORY_MISSES, WARMED};
     if PEAK.swap(0, Ordering::Relaxed) >= 10 {
         tracing::info!(
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
+            memory_hits = MEMORY_HITS.load(Ordering::Relaxed),
+            memory_misses = MEMORY_MISSES.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            warmed = WARMED.load(Ordering::Relaxed),
             "host pipelines all made"
         );
     }

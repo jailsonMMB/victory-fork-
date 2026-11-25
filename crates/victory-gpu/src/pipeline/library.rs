@@ -1,12 +1,11 @@
 //! Compiled host pipelines kept on disk, and the title pipelines worth
 //! starting early (decision 0007, "Pipeline cache").
 //!
-//! 1. Every host pipeline goes into the host's pipeline library, named by
-//!    a hash of all that its host description holds (the translated
-//!    shaders' code, which changes when a translation does, our root
-//!    signature, the graphics state). The library is saved under the cache
-//!    folder; the host refuses a library of another adapter or driver, and
-//!    an entry whose description differs, so neither is ever used.
+//! 1. Where the host supports pipeline libraries, a host pipeline goes into
+//!    the persistent library under a hash of its translated shaders, root
+//!    signature and graphics state. All successfully made or loaded PSOs
+//!    also enter the process-local cache, which remains available when a
+//!    driver rejects pipeline libraries.
 //! 2. The title pipelines a run drew or dispatched with are listed by a key
 //!    known when the title creates them (their shader containers and
 //!    graphics state); the next run hands those to the workers at
@@ -67,6 +66,10 @@ pub fn use_pipeline_cache(dir: PathBuf) {
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
+/// Hits and misses of the process-local host-pipeline cache, and successful early PSOs.
+pub(crate) static MEMORY_HITS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MEMORY_MISSES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WARMED: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
 /// that size is made, filled and written every time pipelines were added,
@@ -438,44 +441,20 @@ const EARLY_FILE: &str = "early-pipelines.txt";
 const EARLY_MAX: usize = 8192;
 
 fn library() -> Option<&'static Library> {
-    // Do not cache an absence: the first pipeline can precede host-device
-    // initialization, and later attempts can retry after initialization.
-    static LIBRARY: OnceLock<Library> = OnceLock::new();
-    static INITIALIZING: Mutex<()> = Mutex::new(());
-    static RETRY_AFTER: AtomicU64 = AtomicU64::new(0);
-    if let Some(library) = LIBRARY.get() {
-        return Some(library);
-    }
-    let now = crate::host::now_ms();
-    if now < RETRY_AFTER.load(Ordering::Relaxed) {
-        return None;
-    }
-    let _initializing = INITIALIZING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(library) = LIBRARY.get() {
-        return Some(library);
-    }
-    let Some(host) = crate::host::host() else {
-        RETRY_AFTER.store(now.saturating_add(5_000), Ordering::Relaxed);
-        return None;
-    };
-    // Host pipeline creation already uses ID3D12Device2. Query the same
-    // interface here; it inherits ID3D12Device1's CreatePipelineLibrary.
-    let device = match host.device.cast::<ID3D12Device2>() {
-        Ok(device) => device,
-        Err(error) => {
-            RETRY_AFTER.store(now.saturating_add(5_000), Ordering::Relaxed);
-            tracing::warn!(error = %error, "host device does not expose ID3D12Device2::CreatePipelineLibrary");
-            return None;
-        }
-    };
-    let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
-    let Some(library) = open(&device, blob) else {
-        RETRY_AFTER.store(now.saturating_add(5_000), Ordering::Relaxed);
-        tracing::warn!("CreatePipelineLibrary failed; will retry");
-        return None;
-    };
-    let _ = LIBRARY.set(library);
-    LIBRARY.get()
+    // VKD3D may reject CreatePipelineLibrary even though ordinary PSO
+    // creation works. Cache that result once; `pipeline` has a process-local
+    // PSO store and must not retry the unsupported API on every save.
+    static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
+    LIBRARY
+        .get_or_init(|| {
+            let host = crate::host::host()?;
+            // The host pipeline path already uses ID3D12Device2, which
+            // inherits ID3D12Device1::CreatePipelineLibrary.
+            let device = host.device.cast::<ID3D12Device2>().ok()?;
+            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
+            open(&device, blob)
+        })
+        .as_ref()
 }
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
@@ -513,7 +492,13 @@ fn open(device: &ID3D12Device2, blob: Blob) -> Option<Library> {
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
     drop(blob);
-    let library = make(&[]).ok()?;
+    let library = match make(&[]) {
+        Ok(library) => library,
+        Err(error) => {
+            tracing::info!(error = %error, "D3D12 pipeline libraries unavailable; using process-local PSO cache");
+            return None;
+        }
+    };
     Some(Library {
         library,
         _blob: Blob::None,
@@ -533,18 +518,19 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
-/// The pipeline named `name`: loaded from the library by `load` if it is
-/// there with the same description, else made by `create` and stored.
+/// The pipeline named `name`: load it from the persistent library where
+/// supported, else compile it; the owning host pipeline is cached by key in
+/// `pipeline::make` for this process.
 pub(crate) fn pipeline(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
-    let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
+    let wide = HSTRING::from(name);
     let began = std::time::Instant::now();
     let loaded = {
         let _all = one_call();
@@ -552,22 +538,20 @@ pub(crate) fn pipeline(
         let _call = call("load", name);
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
-    // The load read the library's file (see `trim`).
     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
     TRIMMED.store(false, Ordering::Relaxed);
     let refused = match loaded {
-        Ok(pso) => {
+        Ok(pipeline) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
             });
-            return Ok(pso);
+            return Ok(pipeline);
         }
-        Err(e) => e,
+        Err(error) => error,
     };
-    // Compiled outside any lock: compiles take up to seconds.
-    let pso = {
+    let pipeline = {
         let _call = call("make", name);
         create()?
     };
@@ -575,7 +559,7 @@ pub(crate) fn pipeline(
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
         format!(
-            "pipeline library: made {label} in {:.1} ms (the library did not load it: {refused})",
+            "pipeline library: made {label} in {:.1} ms (load refused: {refused})",
             began.elapsed().as_secs_f64() * 1e3
         )
     });
@@ -584,18 +568,19 @@ pub(crate) fn pipeline(
     let _call = call("store", name);
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pipeline) }.is_ok() {
         library.added.fetch_add(1, Ordering::Relaxed);
     }
-    Ok(pso)
+    Ok(pipeline)
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// Writes the persistent library when supported and always writes the
+/// early-start list, including on drivers that reject pipeline libraries.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
+    let library = library();
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -603,18 +588,13 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        tracing::warn!(error = %e, "host pipeline library not saved");
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        tracing::warn!(error = %error, "host pipeline cache directory unavailable");
         return;
     }
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
-    // The bytes of the library written to `tmp`; 0 when no pipeline was
-    // added: the library on disk is then what it was, and only the early
-    // list is written (a title pipeline first drawn with wrote all 1,352 MB
-    // of the library again: run 60's second save).
-    let bytes = {
+    let bytes = if let Some(library) = library {
         let _all = one_call();
-        // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
         if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
@@ -623,23 +603,28 @@ pub(crate) fn save(now: bool) {
         if added == 0 {
             0
         } else {
-            // SAFETY: a plain query.
+            // SAFETY: a plain query on the live pipeline library.
             let size = unsafe { library.library.GetSerializedSize() };
             let _call = call("serialise", "the whole library");
-            if let Err(e) = serialise(&library.library, &tmp, size) {
-                tracing::warn!(error = %e, "host pipeline library not serialised");
+            if let Err(error) = serialise(&library.library, &tmp, size) {
+                tracing::warn!(error = %error, "host pipeline library not serialised");
                 let _ = std::fs::remove_file(&tmp);
+                USED_CHANGED.store(true, Ordering::Relaxed);
                 return;
             }
             library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
             size
         }
+    } else {
+        if !USED_CHANGED.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        0
     };
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
-        // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
             REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
@@ -656,14 +641,21 @@ pub(crate) fn save(now: bool) {
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
         Ok(()) => tracing::info!(
+            library = library.is_some(),
             bytes,
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
+            memory_hits = MEMORY_HITS.load(Ordering::Relaxed),
+            memory_misses = MEMORY_MISSES.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
-            "host pipeline library saved"
+            warmed = WARMED.load(Ordering::Relaxed),
+            "host pipeline cache state saved"
         ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Err(error) => {
+            USED_CHANGED.store(true, Ordering::Relaxed);
+            tracing::warn!(error = %error, "host pipeline cache state not saved");
+        }
     }
 }
 
