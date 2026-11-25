@@ -1905,6 +1905,19 @@ impl Shadow {
                 Some(found) => found,
                 None => self.differing(from, to, before),
             };
+            // Merge adjacent pieces: one kernel read/write per run, not per
+            // 64 KiB piece (hundreds of pieces at ~2 ms a kernel call each
+            // were seconds a frame on Wine/vkd3d).
+            let differing = {
+                let mut merged: Vec<(usize, usize)> = Vec::with_capacity(differing.len());
+                for (at, n) in differing {
+                    match merged.last_mut() {
+                        Some(last) if last.0 + last.1 == at => last.1 += n,
+                        _ => merged.push((at, n)),
+                    }
+                }
+                merged
+            };
             #[cfg(feature = "diagnostics")]
             let syncing = {
                 use crate::copystat::{C, add};
@@ -1933,6 +1946,9 @@ impl Shadow {
                 let last = last_difference(host, old).unwrap_or(first);
                 let (at, n) = (at + first, last + 1 - first);
                 let (host, old) = (&mut host[first..=last], &old[first..=last]);
+                if title.len() < n {
+                    title.resize(n, 0);
+                }
                 let title = &mut title[..n];
                 if !crate::host::read_into((start + at) as *const u8, title) {
                     continue;
@@ -2420,8 +2436,10 @@ impl Shadow {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
         let last = (to - 1) / PAGE;
+        // Stale runs as (first page, one past last page), in order.
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut run: Option<usize> = None;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
                 Some(&&(p, w)) if p == page => {
@@ -2440,12 +2458,28 @@ impl Shadow {
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                runs.push((first, page));
             }
         }
-        // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            runs.push((first, last + 1));
+        }
+        if runs.is_empty() {
+            return 0;
+        }
+        // If stale pages cover more than half the range, one whole copy
+        // beats many small kernel calls (Wine: ~0.1 ms a call; scattered
+        // stale pages were 0.6-1.8 s a frame for 85-109 MB).
+        let stale_bytes: usize = runs
+            .iter()
+            .map(|&(a, b)| (b * PAGE).min(to) - (a * PAGE).max(from))
+            .sum();
+        if runs.len() > 1 && stale_bytes * 2 > to - from {
+            return self.copy(from, to);
+        }
+        let mut bytes = 0;
+        for (first, end_page) in runs {
+            bytes += self.copy((first * PAGE).max(from), (end_page * PAGE).min(to));
         }
         bytes
     }

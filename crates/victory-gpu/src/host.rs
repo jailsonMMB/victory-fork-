@@ -2486,7 +2486,16 @@ fn relay_hand_back(back: &[Declared]) {
     let (mut now, mut title) = (Vec::new(), Vec::new());
     for ((shadow, from, to), found) in work.iter().zip(found) {
         let mut written = 0;
+        // Merge adjacent pieces: one kernel read/write per run, not per
+        // 64 KiB piece (see `Shadow::copy_back_with`).
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(found.len());
         for (at, n) in found {
+            match merged.last_mut() {
+                Some(last) if last.0 + last.1 == at => last.1 += n,
+                _ => merged.push((at, n)),
+            }
+        }
+        for (at, n) in merged {
             written += shadow.relay_merge(at, n, &mut now, &mut title);
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
@@ -5210,7 +5219,8 @@ impl HostList {
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
-/// a copy to a thread (`VICTORY_WIDE_REFRESH=1`; off by default).
+/// a copy to a thread (on by default since Wine/vkd3d copies were
+/// 0.6-1.8 s a frame serial; `VICTORY_WIDE_REFRESH=0` keeps them serial).
 ///
 /// A submission brings some sixty copies up to date, one after the other
 /// on the submitting thread: for each, the pages the title wrote are asked
@@ -5223,7 +5233,7 @@ impl HostList {
 /// they are for the title's threads.
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_none_or(|v| v != "0"))
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the

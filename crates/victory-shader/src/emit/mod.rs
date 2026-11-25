@@ -379,7 +379,10 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // A mask with lanes elsewhere (`exact_only`) is only helped by the
+        // exact forms, and `widen` is one of them: try it even without
+        // `VICTORY_WAVE_WIDE=1` (shader `f133e35efed2a48a` stops there).
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || exact_only;
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -420,7 +423,10 @@ pub fn emit(
                     break;
                 }
             }
-            if !local_on || exact_only {
+            // A mask with lanes elsewhere is only helped by the exact
+            // forms: the idiom-exact local waves are one of them, the
+            // approximate ones are not.
+            if !local_on || (exact_only && !exact) {
                 continue;
             }
             for (name, f) in &forms {
