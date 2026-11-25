@@ -33,6 +33,7 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    prewarm: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -56,12 +57,18 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            prewarm: AtomicBool::new(false),
         }
     }
 
     fn make(&self) {
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        if self.prewarm.swap(false, Ordering::Relaxed)
+            && self.made.get().is_some_and(|pipeline| pipeline.is_some())
+        {
+            super::library::WARMED.fetch_add(1, Ordering::Relaxed);
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -269,12 +276,18 @@ fn start(p: &Arc<Pending>, priority: u8) {
     }
     if !workers() {
         if p.queue_state.swap(MAKING, Ordering::Relaxed) == NOT_QUEUED {
+            if priority == EARLY {
+                p.prewarm.store(true, Ordering::Relaxed);
+            }
             p.make();
         }
         return;
     }
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
+        if priority == EARLY {
+            p.prewarm.store(true, Ordering::Relaxed);
+        }
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
@@ -333,12 +346,15 @@ static PEAK: AtomicU64 = AtomicU64::new(0);
 /// The workers ran out of work: logged after a batch of 10 or more, and
 /// the cache saved (at most every 20 s).
 fn drained() {
-    use super::library::{EARLY, LOADED, MADE};
+    use super::library::{EARLY, LOADED, MADE, MEMORY_HITS, MEMORY_MISSES, WARMED};
     if PEAK.swap(0, Ordering::Relaxed) >= 10 {
         tracing::info!(
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
+            memory_hits = MEMORY_HITS.load(Ordering::Relaxed),
+            memory_misses = MEMORY_MISSES.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            warmed = WARMED.load(Ordering::Relaxed),
             "host pipelines all made"
         );
     }
