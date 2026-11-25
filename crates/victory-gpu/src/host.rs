@@ -1615,11 +1615,6 @@ fn wide_merge() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_none_or(|v| v != "0"))
 }
 
-/// Pieces of a copy in the card's memory closer than this are fetched and
-/// put back as one run (`VICTORY_COPYBACK_SMALL=1`): under 4 KiB of extra
-/// bytes to read and write, for one kernel call less.
-const SMALL_GAP: usize = 4 << 10;
-
 /// One declared range of a copy in the card's memory, in a submission.
 struct CardRange {
     shadow: std::sync::Arc<crate::shadow::Shadow>,
@@ -3549,7 +3544,7 @@ impl Host {
         let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
         let mut total = 0u64;
         {
-            let close = if crate::shadow::merge_small_runs() { SMALL_GAP } else { 0 };
+            let close = crate::shadow::card_join_gap();
             let mut joined: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::with_capacity(found.len());
             for (shadow, lo, hi) in found {
                 match joined.last_mut() {
@@ -3848,7 +3843,7 @@ impl Host {
         // they already are (the merge writes the copy's bytes only where
         // the card changed them).
         {
-            let close = if crate::shadow::merge_small_runs() { SMALL_GAP } else { 0 };
+            let close = crate::shadow::card_join_gap();
             let mut joined: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(found.len());
             for (k, i, lo, hi) in found {
                 match joined.last_mut() {
@@ -6250,11 +6245,19 @@ impl Meter {
                     let writes = card[card_stat::WRITES];
                     let calls = runs + writes;
                     let kernel_us = (card[card_stat::READ_US] + card[card_stat::WRITE_US]) as f64;
+                    // What the runs cover, against the bytes fetched: a run
+                    // is what a kernel call costs, so a frame that fetches a
+                    // lot and puts back a little in few runs has met the
+                    // floor, and one that puts back a lot in many runs is
+                    // paying per run and not per byte.
+                    let per_run = card[card_stat::BYTES] as f64 / runs as f64 / 1024.0;
                     tracing::info!(
-                        "  the pieces put back, per frame: {:.0} runs with a byte that differs, {:.0} kernel reads \
-                         and {:.0} kernel writes ({:.2} ms a call, {:.1} ms in all), the byte merge between them \
-                         {:.1} ms (VICTORY_COPYBACK_SMALL=1 joins runs under 4 KiB)",
+                        "  the pieces put back, per frame: {:.0} runs with a byte that differs ({:.1} KiB a run), \
+                         {:.0} kernel reads and {:.0} kernel writes ({:.2} ms a call, {:.1} ms in all), the byte \
+                         merge between them {:.1} ms (VICTORY_COPYBACK_SMALL=1 joins runs under 4 KiB, \
+                         VICTORY_COPYBACK_GAP bytes takes any gap)",
                         runs as f64 / frames,
+                        bytes(per_run),
                         card[card_stat::READS] as f64 / frames,
                         writes as f64 / frames,
                         if calls > 0 { kernel_us / 1e3 / calls as f64 } else { 0.0 },

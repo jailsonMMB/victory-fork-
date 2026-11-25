@@ -170,7 +170,7 @@ static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 /// These are counted always, not only with the `diagnostics` feature: the
 /// frame's largest cost without the swapchain in the way is this one, and
 /// it was invisible in a plain build.
-pub(crate) static CARD_STATS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+pub(crate) static CARD_STATS: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
 
 /// The indices of [`CARD_STATS`] the putting back of pieces uses.
 pub(crate) mod card_stat {
@@ -184,12 +184,14 @@ pub(crate) mod card_stat {
     pub(crate) const WRITE_US: usize = 14;
     /// The byte-by-byte merge between them.
     pub(crate) const MERGE_US: usize = 15;
+    /// Bytes the runs cover, read and written whatever their size.
+    pub(crate) const BYTES: usize = 16;
 }
 
 /// [`CARD_STATS`], taken; then the copies in the card's memory, their
 /// bytes and their "before" twins' bytes.
-pub(crate) fn card_stats() -> [u64; 16] {
-    let mut out = [0u64; 16];
+pub(crate) fn card_stats() -> [u64; 17] {
+    let mut out = [0u64; 17];
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
@@ -1095,6 +1097,38 @@ pub(crate) fn merge_small_runs() -> bool {
 /// Runs shorter than this are merged with their neighbours under
 /// [`merge_small_runs`].
 const SMALL_RUN: usize = 4 << 10;
+
+/// How far apart two pieces of a copy in the card's memory may be and still
+/// go back as one run, without being asked ([`card_join_gap`]).
+pub(crate) const SMALL_GAP: usize = 4 << 10;
+
+/// `VICTORY_COPYBACK_GAP`: how far apart two pieces of a copy in the card's
+/// memory may be and still be fetched and put back as one run, in bytes
+/// (`4096`, `64k`, `1m`). Unset: nothing, or 4 KiB with
+/// `VICTORY_COPYBACK_SMALL=1`.
+///
+/// The gap costs bytes and saves runs, and a run costs the kernel a read
+/// and a write whatever its size: a frame of 1,500 runs of 64 KiB and a
+/// frame of 60 runs of 2 MB hold the same bytes and are seconds apart. The
+/// knob is what tells the two apart in one build. `1073741824` joins every
+/// piece of a copy into one run, which is the extreme to measure against.
+pub(crate) fn card_join_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        let Some(raw) = std::env::var("VICTORY_COPYBACK_GAP").ok() else {
+            return if merge_small_runs() { SMALL_GAP } else { 0 };
+        };
+        let raw = raw.trim().to_ascii_lowercase();
+        let (digits, scale) = match raw.strip_suffix('k') {
+            Some(d) => (d, 1usize << 10),
+            None => match raw.strip_suffix('m') {
+                Some(d) => (d, 1usize << 20),
+                None => (raw.as_str(), 1usize),
+            },
+        };
+        digits.parse::<usize>().map(|n| n.saturating_mul(scale)).unwrap_or(0)
+    })
+}
 
 /// `runs` (offsets into a copy, in order, disjoint) with every run shorter
 /// than [`SMALL_RUN`] joined to the run before it: the bytes between them
@@ -2718,6 +2752,7 @@ impl Shadow {
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
         CARD_STATS[card_stat::RUNS].fetch_add(1, Ordering::Relaxed);
+        CARD_STATS[card_stat::BYTES].fetch_add(n as u64, Ordering::Relaxed);
         title.clear();
         title.resize(n, 0);
         let mut written = 0;
@@ -2797,6 +2832,7 @@ impl Shadow {
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
         CARD_STATS[card_stat::RUNS].fetch_add(1, Ordering::Relaxed);
+        CARD_STATS[card_stat::BYTES].fetch_add(n as u64, Ordering::Relaxed);
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
