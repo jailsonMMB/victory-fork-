@@ -5844,8 +5844,19 @@ fn direct_read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     //
     // (Not sampled: a page in the middle that is gone would fault the copy,
     // and a fault in memcpy is the process's.)
+    //
+    // The limit is the price of asking, and asking is what the limit
+    // reasons about: a range the runtime's own table answers
+    // (`crate::inplace::committed_known`) costs no kernel call whatever its
+    // length, so it is not held to it. 30-66 runs of 256 KiB to 1 MiB a
+    // frame were going the kernel's way for the asking alone.
     const ASK_LIMIT: usize = 256 << 10;
-    if len > ASK_LIMIT {
+    // Over the limit only the table is asked: what the limit guards against
+    // is the price of asking, and a range the runtime's own record answers
+    // costs nothing. Up to it `crate::texture::committed` asks the table
+    // first and the kernel only for what the table does not know, so the
+    // range is asked about once and counted once.
+    if len > ASK_LIMIT && !crate::inplace::committed_known(src as usize, len) {
         DIRECT_TOO_LONG.fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -5873,8 +5884,20 @@ const TITLE_COPY_ASK: usize = 1 << 20;
 /// working-set query and a one-byte probe where that cannot say), of both
 /// sides.
 fn both_readable(dst: *mut u8, src: *const u8, len: usize) -> bool {
-    if len == 0 || len > TITLE_COPY_ASK {
+    if len == 0 {
         return false;
+    }
+    // `TITLE_COPY_ASK` is the price of asking, and asking is what it
+    // reasons about: a range the runtime's own record answers
+    // (`crate::inplace::committed_known`) costs no kernel call whatever its
+    // length, so past the cap only the table is asked, and both sides must
+    // be known there. Up to the cap the question goes through
+    // `crate::texture::committed`, which asks the table first itself and
+    // the kernel only for what the table does not know — so each side is
+    // asked exactly once, and the frame line counts each byte once.
+    if len > TITLE_COPY_ASK {
+        return crate::inplace::committed_known(src as usize, len)
+            && crate::inplace::committed_known(dst as usize, len);
     }
     let asked = std::time::Instant::now();
     let both = crate::texture::committed(src, len) && crate::texture::committed(dst, len);
@@ -5894,9 +5917,26 @@ fn both_readable(dst: *mut u8, src: *const u8, len: usize) -> bool {
 /// 0.2-11 MB of it, and the largest single cost of the frame was two ranges
 /// of our own address space being moved by a syscall.
 pub(crate) fn copy_title_to_title(dst: *mut u8, src: *const u8, len: usize) -> bool {
-    if !direct_reads() || !both_readable(dst, src, len) {
+    if !direct_reads() || len == 0 {
         return false;
     }
+    // The reading side for the copy, as [`direct_read`] takes it: the
+    // runtime must not unmap a page of `src` (nor of `dst`, which it holds
+    // under the same lock) mid-copy. This mattered little while the direct
+    // way took 0.1 MB a frame; with the runtime's own table answering for
+    // whole runs it is the copy of nearly all of them.
+    let Some(_reading) = Reading::take() else {
+        return false;
+    };
+    if !both_readable(dst, src, len) {
+        return false;
+    }
+    // The destination is written behind the watch's back: the guards open
+    // and the placed textures there change, exactly as the kernel's way
+    // does before `read` (`copy_mapped`). Then [`run_deferred`]'s
+    // `watch::wrote` sees the pages as written after this submission's
+    // asking, as it does for every other step.
+    crate::watch::writing(dst as usize, len);
     // SAFETY: both sides were found readable and are this process's own
     // memory; the runtime's copies are between distinct allocations.
     unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
@@ -6315,13 +6355,19 @@ impl Meter {
             let long = DIRECT_TOO_LONG.swap(0, Ordering::Relaxed) as f64 / frames;
             let ask = ASKING_US.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
             let title = DIRECT_COPIES.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
-            if read > 0.0 || wrote > 0.0 || refused > 0.0 || long > 0.0 || title > 0.0 {
+            // What the runtime's own table answered, so that a frame line
+            // says whether the kernel was asked at all.
+            let known_mb = crate::inplace::KNOWN_BYTES.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
+            let known = crate::inplace::KNOWN_CALLS.swap(0, Ordering::Relaxed) as f64 / frames;
+            let missed = crate::inplace::KNOWN_MISSED.swap(0, Ordering::Relaxed) as f64 / frames;
+            if read > 0.0 || wrote > 0.0 || refused > 0.0 || long > 0.0 || title > 0.0 || known > 0.0 {
                 tracing::info!(
                     "  copied without the kernel, per frame: {read:.1} MB read into host memory ({title:.1} MB of it \
                      title memory into title memory) and {wrote:.1} MB written into title memory, as `memcpy` \
                      (VICTORY_DIRECT_READ=0 keeps the kernel's way); {ask:.1} ms asking whether the pages were \
                      there; {refused:.0} reads a frame left to the kernel (a page could not be read), {long:.0} were \
-                     over the most that is asked about"
+                     over the most that is asked about; the runtime's own table answered {known:.0} questions a frame \
+                     ({known_mb:.1} MB) and knew nothing of {missed:.0} (VICTORY_KNOWN_MEMORY=0 asks the kernel as before)"
                 );
             }
         }

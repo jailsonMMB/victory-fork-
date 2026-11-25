@@ -343,6 +343,123 @@ pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views().views, at, len)
 }
 
+/// Bytes that [`committed_known`] answered without asking the kernel since
+/// the last frame line, and the calls it answered.
+pub(crate) static KNOWN_BYTES: AtomicU64 = AtomicU64::new(0);
+/// See [`KNOWN_BYTES`].
+pub(crate) static KNOWN_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Calls a frame that had to ask the kernel because the table did not hold
+/// the range.
+pub(crate) static KNOWN_MISSED: AtomicU64 = AtomicU64::new(0);
+
+/// Memory the runtime gave the title and may take back, by address: bytes.
+/// Recorded when it is handed out ([`title_memory_given`]) and removed the
+/// moment it is freed ([`title_memory_taken`]), so a range the table holds
+/// is committed and readable — and one it does not is asked of the kernel.
+///
+/// This is what a copy asks before it copies: the question `VirtualQuery`
+/// or a batched working-set query answers by walking the page tables, and
+/// that under Wine answers with one byte read through the kernel for every
+/// page it leaves out. That asking measured 461-667 ms a frame, 2,700
+/// copies into 82-131 MB, and it is the largest single cost left in
+/// `preparing`.
+///
+/// Only memory the runtime hands out itself is here. Anything else — the
+/// title's own `kernel32!VirtualAlloc`, memory nobody in this process
+/// allocated — is not, and a range that is not here goes to the kernel
+/// exactly as before. A stale "committed" would fault the copy, which is
+/// the process's: every path that gives memory back must call
+/// [`title_memory_taken`], and the table answers for nothing it was not
+/// told.
+static GIVEN: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// Whether the given-memory table is kept (`VICTORY_KNOWN_MEMORY=0` turns
+/// it off, back to asking the kernel every time).
+fn known_memory() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KNOWN_MEMORY").is_none_or(|v| v != "0"))
+}
+
+fn given() -> std::sync::MutexGuard<'static, BTreeMap<usize, usize>> {
+    GIVEN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The runtime handed the title `[at, at + len)`, committed and readable
+/// for as long as it is not freed.
+pub(crate) fn title_memory_given(at: usize, len: usize) {
+    if len == 0 || !known_memory() {
+        return;
+    }
+    given().insert(at, len);
+}
+
+/// The runtime took `[at, at + len)` back: it is no longer the table's
+/// answer, and every grant that overlaps it goes with it (a grant cut in
+/// two by the free could not be trusted for either part).
+///
+/// Called before the memory is actually freed, never after: between the two
+/// the table already says nothing, so a copy asks the kernel rather than
+/// trust a range that is about to go.
+pub(crate) fn title_memory_taken(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut g = given();
+    if g.is_empty() {
+        return;
+    }
+    let end = at.saturating_add(len);
+    // Grants that start before `at` and reach into it (one of them may
+    // contain the whole range), then those that start inside it.
+    let before = g.range(..at).next_back().filter(|&(&base, &bytes)| base.saturating_add(bytes) > at).map(|(&base, _)| base);
+    let mut gone: Vec<usize> = before.into_iter().collect();
+    gone.extend(g.range(at..end).map(|(&base, _)| base));
+    for base in gone {
+        g.remove(&base);
+    }
+}
+
+/// Whether `[at, at + len)` is committed memory the runtime itself gave the
+/// title and has not taken back, so that no kernel call has to say so.
+///
+/// True when one granted range holds all of it, or when the title's views
+/// hold all of it: a view is committed read-write by construction, since
+/// `xmem` reports it only after `MapViewOfFile3` and `commit` have both
+/// succeeded ([`title_memory_view`]), and reports every range it takes away
+/// ([`views_gone`], from [`crate::title_memory_remapped`]) — both with
+/// [`crate::watch::title_memory_remapping`]'s write side held, so no read
+/// of title memory in place can fall between a view going and the news of
+/// it arriving.
+///
+/// False, without a kernel call, is not the answer: the caller asks the
+/// kernel as it did before. That is what makes the table safe — it never
+/// says "there" about memory it was not told of, so the only way it can be
+/// wrong is by keeping a grant whose memory is gone, and every free path
+/// takes it out.
+pub(crate) fn committed_known(at: usize, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if !known_memory() {
+        return false;
+    }
+    let end = at.saturating_add(len);
+    let granted = {
+        let g = given();
+        g.range(..=at)
+            .next_back()
+            .is_some_and(|(&base, &bytes)| base.saturating_add(bytes) >= end)
+    };
+    let held = granted || matches!(cover(at, len), Cover::Run(..) | Cover::Scattered);
+    if held {
+        KNOWN_CALLS.fetch_add(1, Ordering::Relaxed);
+        KNOWN_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+    } else {
+        KNOWN_MISSED.fetch_add(1, Ordering::Relaxed);
+    }
+    held
+}
+
 /// Whether `[at, at + len)` is private memory, all committed and
 /// read-write: what [`From::Part`] takes. One question to Windows (it
 /// walks the page tables to the end of the pages that share the first

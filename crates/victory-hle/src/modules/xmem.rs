@@ -162,6 +162,14 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
     }
+    // Not recorded for `victory_gpu`'s table of committed memory, though it
+    // is committed: the title frees such a block with the host's own
+    // `kernel32!VirtualFree`, which no part of the runtime sees, so nothing
+    // here could take the range out again — and a table entry for freed
+    // memory is a copy that faults. What is recorded is memory the runtime
+    // holds the free of (`victory_gpu::resource`'s `Memory`, whose drop
+    // removes the entry) and the views of physical pages (taken out on every
+    // remap). Those are the copies the table answers for.
     at
 }
 

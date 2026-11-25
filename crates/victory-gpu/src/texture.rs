@@ -682,7 +682,10 @@ impl Staging {
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
-        if !committed(self.memory, size) {
+        // The pages themselves, not the runtime's table: a texture still
+        // streaming in has some mips' pages only, and the table answers
+        // whole grants, which is not this question.
+        if !committed_by_pages(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
             // copy, which stands unmapped pages (zeros), and upload what
@@ -833,12 +836,38 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
     let size = s.layout.size as usize;
-    Some((size as u64, committed(s.memory, size)))
+    Some((size as u64, committed_by_pages(s.memory, size)))
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
+///
+/// This is the question a copy asks before it reads or writes: "is every
+/// page there". The runtime's own record answers it first
+/// ([`crate::inplace::committed_known`]); where that record does not cover
+/// the range, the kernel is asked exactly as before. Not used to measure
+/// *how much* of a range has arrived — that is [`mapped_bytes`], which
+/// asks the pages themselves, because a texture streaming in must be
+/// uploaded in part and the table can only say "all or nothing".
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
+    if crate::inplace::committed_known(at as usize, len) {
+        return true;
+    }
+    if by_query() {
+        return committed_by_query(at, len);
+    }
+    if len == 0 {
+        return true;
+    }
+    let (there, of) = readable(at as usize, len, true);
+    there == of
+}
+
+/// [`committed`] without the runtime's table: the pages themselves say.
+/// For the one caller that must know about a texture streaming in, where
+/// the table's "the runtime granted this range whole" is not the question
+/// (a granted range may still have pages the title has not committed yet).
+fn committed_by_pages(at: *const u8, len: usize) -> bool {
     if by_query() {
         return committed_by_query(at, len);
     }
@@ -940,7 +969,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     }
     let start = at as usize;
     let end = start.saturating_add(len);
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
+    if !committed_by_pages(at, 1) && !committed_by_pages((end - 1) as *const u8, 1) {
         return 0;
     }
     if !by_query() {
