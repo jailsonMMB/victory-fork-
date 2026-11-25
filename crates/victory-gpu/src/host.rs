@@ -2608,11 +2608,11 @@ fn relay_hand_back(back: &[Declared]) {
         })
         .collect();
     crate::shadow::wide_run(jobs);
-    for (span, (_, from, to)) in work.iter().enumerate() {
+    for (span, (_, _from, _to)) in work.iter().enumerate() {
         let written = written[span].load(Ordering::Relaxed);
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::compared(*from, to - from, written);
+        crate::copystat::compared(*_from, _to - _from, written);
     }
 }
 
@@ -2880,10 +2880,10 @@ fn hand_back(back: &[Declared]) {
             })
             .collect();
         let written = merge_runs(runs, work.len());
-        for ((_, from, to), written) in work.iter().zip(written) {
+        for ((_, _from, _to), written) in work.iter().zip(written) {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::compared(*from, to - from, written);
+            crate::copystat::compared(*_from, _to - _from, written);
         }
         for (shadow, declared) in back {
             shadow.copy_back_done(declared);
@@ -3537,8 +3537,8 @@ impl Host {
         // pieces a heavy frame, a kernel read and maybe a write each.
         let written = {
             use std::sync::atomic::AtomicUsize;
-            // The mapping's address (`data` borrows the work's slot).
-            let fetched = *data;
+            // The mapping's address (`data` is the slot's own word here).
+            let fetched = data;
             let written = std::sync::Arc::new(AtomicUsize::new(0));
             let each = pieces.len().div_ceil(8).max(4);
             let jobs: Vec<crate::shadow::Job> = if wide_hand_back() && pieces.len() >= 2 {
