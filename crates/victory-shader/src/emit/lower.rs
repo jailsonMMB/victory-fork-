@@ -947,6 +947,8 @@ thread_local! {
     static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
     /// See [`with_local_waves`].
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_implicit_wave`].
+    static IMPLICIT_WAVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -963,6 +965,30 @@ pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
     let r = with_local_waves(f);
     LOCAL_ANY.set(was);
     r
+}
+
+/// Runs `f` leaving out the shader's `WaveSize` attribute: the host then
+/// runs the wave size its own GPU has (`WaveLaneCountMax`), and cross-lane
+/// operations work with it.
+///
+/// A console wave64 program lowered to waves of 32 carries
+/// `WaveSize(32)`: exact, and the way a GPU whose widest wave is 32 runs
+/// it. A host that refuses such a pipeline (`CreateComputePipelineState`
+/// `E_INVALIDARG` on Wine/vkd3d, from the driver behind it) is asked
+/// again without the attribute: the program then runs in waves of 64 on a
+/// GPU that has them (`lower`'s cross-lane code takes the size it
+/// finds), or of 32 where it does not, which is what the title's code
+/// expects of a wave of its own.
+pub(super) fn with_implicit_wave<R>(f: impl FnOnce() -> R) -> R {
+    let was = IMPLICIT_WAVE.replace(true);
+    let r = f();
+    IMPLICIT_WAVE.set(was);
+    r
+}
+
+/// Whether [`with_implicit_wave`] is on: no `WaveSize` attribute.
+fn implicit_wave() -> bool {
+    IMPLICIT_WAVE.get()
 }
 
 /// Runs `f` with console wave64 programs on 32-lane hosts lowered with each
@@ -1386,7 +1412,7 @@ impl<'a> Lower<'a> {
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
             }
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            if (console_lanes || one_wave && s.lds_dwords > 0) && !implicit_wave() {
                 s.wave_size = Some(wave);
             }
         }
@@ -5795,13 +5821,20 @@ impl<'a> Lower<'a> {
                 };
                 let mut words = vec![(2, n)];
                 // Its address too, where the code computes with it and the
-                // host can tell it.
-                let computed = (0..2u8).any(|k| {
-                    inst.write(Reg::S(code + first + k))
+                // host can tell it. The load need not start at the
+                // descriptor's first dword: one that takes only the high
+                // half of the address (`s_load_dword` of dword 1, for a
+                // compare against a 64-bit address) reads that dword from
+                // the words above, whichever `first` it is, as long as the
+                // address is computed from anything here. Asking only a load
+                // that started at dword 0 left such a dword missing, and a
+                // missing dword stops the program: two of the title's pixel
+                // shaders were dropped for it in the prison scene.
+                let computed = (0..2u8).any(|d| {
+                    inst.write(Reg::S(code + d + first))
                         .is_some_and(|v| self.computed_with(v, 6))
                 });
-                if first == 0
-                    && computed
+                if computed
                     && let Some((lo, hi)) = self.view_address(site)
                 {
                     words.extend([(0, lo), (1, hi)]);
@@ -5810,8 +5843,10 @@ impl<'a> Lower<'a> {
             }
         };
         for k in 0..count {
-            let rel = k.wrapping_sub(u32::from(first));
-            match words.iter().find(|w| w.0 == rel) {
+            // Register `code + k` takes the descriptor's dword `first + k`
+            // (the load's first output is dword `first`).
+            let dword = u32::from(first) + k;
+            match words.iter().find(|w| w.0 == dword) {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {

@@ -63,6 +63,10 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// The same, without the `WaveSize` attribute: for a host that
+    /// refused the pipeline ([`Shader::translated_implicit`]).
+    #[cfg(windows)]
+    implicit: OnceLock<Option<Translated>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -113,6 +117,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                implicit: OnceLock::new(),
             })
         })
         .clone()
@@ -173,7 +179,50 @@ impl Shader {
 }
 
 #[cfg(windows)]
+impl Shader {
+    /// [`Shader::translated`] again, leaving the `WaveSize` attribute out
+    /// ([`victory_shader::emit::translate_implicit_wave`]): the host runs
+    /// its own wave size. For a host that refused the pipeline made from
+    /// the first translation (`E_INVALIDARG`), once per shader.
+    pub(crate) fn translated_implicit(&self) -> Option<&Translated> {
+        self.implicit
+            .get_or_init(|| {
+                let done = translate_implicit(&self.container);
+                match &done {
+                    Ok(t) => tracing::info!(
+                        stage = self.stage,
+                        hash = %self.hash,
+                        user_data = t.host.user_data.len(),
+                        "shader translated without a wave size (the host refused the first)"
+                    ),
+                    Err(e) => tracing::warn!(
+                        stage = self.stage,
+                        hash = %self.hash,
+                        error = %e,
+                        "shader does not translate without a wave size either"
+                    ),
+                }
+                done.ok()
+            })
+            .as_ref()
+    }
+}
+
+#[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
+    translate_as(container, false)
+}
+
+#[cfg(windows)]
+fn translate_implicit(container: &[u8]) -> Result<Translated, String> {
+    translate_as(container, true)
+}
+
+/// [`translate`] with `implicit`: the translation without a `WaveSize`
+/// attribute ([`Shader::translated_implicit`]; the shader cache holds those
+/// of the plain form only).
+#[cfg(windows)]
+fn translate_as(container: &[u8], implicit: bool) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
@@ -182,7 +231,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    let host = if implicit {
+        victory_shader::emit::translate_implicit_wave(container).map_err(|e| e.to_string())?
+    } else {
+        crate::shader_cache::host_shader(container)?
+    };
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs
         .into_iter()

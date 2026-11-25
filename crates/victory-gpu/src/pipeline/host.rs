@@ -268,6 +268,9 @@ pub(crate) fn bounded_root_srvs() -> bool {
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
+    /// Use the translation without a `WaveSize` attribute
+    /// ([`Shader::translated_implicit`]): the host refused the other.
+    pub(crate) implicit: bool,
     /// The root parameter of its user data, and its size in dwords.
     pub(crate) user_data: Option<(u32, u32)>,
     /// Root parameters of its root views: (title root parameter, ours).
@@ -278,10 +281,19 @@ pub(crate) struct Stage {
     pub(crate) root_uavs: Vec<(u8, u32)>,
 }
 
+/// The translation of `s` the host will be given: the plain one, or
+/// (when it refused that) the one without a `WaveSize`.
+fn translation(s: &Shader, implicit: bool) -> Option<&Translated> {
+    if implicit {
+        s.translated_implicit()
+    } else {
+        s.translated()
+    }
+}
+
 impl Stage {
     pub(crate) fn translated(&self) -> &Translated {
-        self.shader
-            .translated()
+        translation(&self.shader, self.implicit)
             .expect("host pipelines are made from translated shaders")
     }
 }
@@ -311,14 +323,14 @@ pub(crate) struct HostPipeline {
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
-fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
+fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<Built> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&reason) {
         seen.push(reason);
         tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
     }
-    None
+    Some(Built::Refused)
 }
 
 impl HostPipeline {
@@ -328,6 +340,48 @@ impl HostPipeline {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
+        match Self::build(shaders, g, false) {
+            Built::Made(p) => Some(p),
+            Built::Refused => None,
+            // The host refused the shaders as translated (`E_INVALIDARG`:
+            // Wine/vkd3d passing a `WaveSize` on to a driver that will not
+            // take it): once more with the waves the host has.
+            // `VICTORY_WAVE_IMPLICIT=0` keeps the refusal instead.
+            Built::WaveSize if implicit_wave_on() => Self::build(shaders, g, true).made(),
+            Built::WaveSize => None,
+        }
+    }
+}
+
+/// What [`HostPipeline::build`] came to.
+///
+/// (`WaveSize`: the host refused the pipeline with `E_INVALIDARG` and every
+/// shader of it declares a wave size, so the attribute is the suspect.)
+enum Built {
+    Made(HostPipeline),
+    /// Refused for a reason no other translation can help.
+    Refused,
+    /// Refused at `CreatePipelineState` with `E_INVALIDARG`.
+    WaveSize,
+}
+
+impl Built {
+    fn made(self) -> Option<HostPipeline> {
+        match self {
+            Built::Made(p) => Some(p),
+            Built::Refused | Built::WaveSize => None,
+        }
+    }
+}
+
+impl HostPipeline {
+    /// [`HostPipeline::new`] with each stage's translation chosen:
+    /// `implicit` takes the one without a `WaveSize` attribute.
+    fn build(shaders: &[Arc<Shader>], g: Option<&GraphicsState>, implicit: bool) -> Built {
+        Self::build_inner(shaders, g, implicit).unwrap_or(Built::Refused)
+    }
+
+    fn build_inner(shaders: &[Arc<Shader>], g: Option<&GraphicsState>, implicit: bool) -> Option<Built> {
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -360,7 +414,7 @@ impl HostPipeline {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         for (s, _) in &stages {
-            s.translated()?;
+            translation(s, implicit)?;
         }
         let host = host()?;
 
@@ -372,9 +426,10 @@ impl HostPipeline {
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         for &(shader, visibility) in &stages {
-            let t = &shader.translated()?.host;
+            let t = &translation(shader, implicit)?.host;
             let mut stage = Stage {
                 shader: shader.clone(),
+                implicit,
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
@@ -492,11 +547,11 @@ impl HostPipeline {
             Ok(root) => root,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
-                return None;
+                return Some(Built::Refused);
             }
         };
         let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
+            stages.get(i).and_then(|(s, _)| translation(s, implicit)).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| D3D12_SHADER_BYTECODE {
                     pShaderBytecode: t.host.dxil.as_ptr().cast(),
@@ -522,14 +577,20 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
+                    // A wave size the driver behind the host will not
+                    // take: the program again with the waves it has.
+                    if !implicit && declares_wave_size(&bound) {
+                        tracing::info!(error = %e, ?shaders, "host pipeline refused; again without a wave size");
+                        return Some(Built::WaveSize);
+                    }
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
-                    return None;
+                    return Some(Built::Refused);
                 }
             };
             tracing::info!(?shaders, "host pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
-            return Some(HostPipeline {
+            return Some(Built::Made(HostPipeline {
                 compute: true,
                 mesh: false,
                 pso,
@@ -540,7 +601,7 @@ impl HostPipeline {
                 inputs: Vec::new(),
                 rects: false,
                 state: String::new(),
-            });
+            }));
         }
         let Some(g) = g else {
             return refuse("graphics state not kept (plain description)", shaders);
@@ -560,14 +621,18 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
+                    if !implicit && declares_wave_size(&bound) {
+                        tracing::info!(error = %e, ?shaders, "host mesh pipeline refused; again without a wave size");
+                        return Some(Built::WaveSize);
+                    }
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
-                    return None;
+                    return Some(Built::Refused);
                 }
             };
             tracing::info!(?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
-            return Some(HostPipeline {
+            return Some(Built::Made(HostPipeline {
                 compute: false,
                 mesh: true,
                 pso,
@@ -578,7 +643,7 @@ impl HostPipeline {
                 inputs: Vec::new(),
                 rects: false,
                 state: String::new(),
-            });
+            }));
         }
 
         // A pipeline the title makes for rectangles gets a geometry stage
@@ -663,9 +728,13 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
+                if !implicit && declares_wave_size(&bound) {
+                    tracing::info!(error = %e, ?shaders, "host pipeline refused; again without a wave size");
+                    return Some(Built::WaveSize);
+                }
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
-                return None;
+                return Some(Built::Refused);
             }
         };
         tracing::info!(?shaders, "host pipeline");
@@ -679,7 +748,7 @@ impl HostPipeline {
             cull = g.rasterizer.CullMode.0,
             "host graphics state"
         );
-        Some(HostPipeline {
+        Some(Built::Made(HostPipeline {
             compute: false,
             mesh: false,
             pso,
@@ -716,8 +785,27 @@ impl HostPipeline {
                     b.RenderTargetWriteMask
                 )
             },
-        })
+        }))
     }
+}
+
+/// `VICTORY_WAVE_IMPLICIT=0`: a pipeline the host refuses
+/// (`E_INVALIDARG`) is not asked for again without a `WaveSize` attribute
+/// ([`HostPipeline::new`]).
+fn implicit_wave_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_IMPLICIT").is_none_or(|v| v != "0"))
+}
+
+/// Whether every stage of `stages` is translated to declare a wave size
+/// (DXIL method properties `WaveSize(32|64)`, `lower`'s
+/// [`victory_shader::emit::set_host_max_wave`] forms): the attribute a host
+/// may refuse a pipeline over.
+fn declares_wave_size(stages: &[Stage]) -> bool {
+    stages.iter().all(|stage| {
+        translation(&stage.shader, stage.implicit)
+            .is_some_and(|t| t.host.wave_size.is_some())
+    })
 }
 
 /// A mesh pipeline from the title's graphics state: the pipeline-state

@@ -239,6 +239,9 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// The wave size the code declares (`WaveSize(n)`), if any: cross-lane
+    /// operations are lowered for it.
+    pub wave_size: Option<u32>,
 }
 
 impl HostShader {
@@ -271,6 +274,32 @@ pub struct UserData {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translated(container, false)
+}
+
+/// As [`translate`], with each emitted shader's `WaveSize` attribute left
+/// out: the host runs the waves its GPU has.
+///
+/// For a host that refuses a translated pipeline at
+/// `CreateComputePipelineState`/`CreateGraphicsPipelineState` with
+/// `E_INVALIDARG`: Wine/vkd3d passes the wave size on to a driver that may
+/// not take a wave of 32 lanes for a program whose console wave was 64,
+/// whatever the program is. Worth nothing where the host's waves are not
+/// 32 (it is refused then): the code takes the size it finds (`lower`), so
+/// a wave of 32 is what the title's code expects of a wave of its own, and
+/// a wave of 64 would not be.
+pub fn translate_implicit_wave(container: &[u8]) -> Result<HostShader, ShaderError> {
+    if lower::host_max_wave() != 32 {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "no wave size left out where the host's waves are not 32 lanes",
+        });
+    }
+    translated(container, true)
+}
+
+/// [`translate`] with `implicit`: no `WaveSize` attribute ([`translate_implicit_wave`]).
+fn translated(container: &[u8], implicit: bool) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -287,14 +316,21 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
-    let p = crate::spill::build(&native)?;
-    // Structurisation first: tracing per-lane descriptors needs it (its
-    // failure is reported after the earlier stages').
-    let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
-    let io = io::raise(&p, &native)?;
-    let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    let run = || {
+        let p = crate::spill::build(&native)?;
+        // Structurisation first: tracing per-lane descriptors needs it (its
+        // failure is reported after the earlier stages').
+        let st = structure::structure(&p);
+        let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+        let io = io::raise(&p, &native)?;
+        let st = st?;
+        emit(&c, &native, &p, &st, &io, &res)
+    };
+    if implicit {
+        lower::with_implicit_wave(run)
+    } else {
+        run()
+    }
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -664,6 +700,7 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        wave_size,
     };
     Ok((shader, wave_size))
 }
@@ -1039,6 +1076,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            wave_size: None,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1051,6 +1089,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                wave_size: None,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -1340,6 +1379,7 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
+                wave_size: None,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [

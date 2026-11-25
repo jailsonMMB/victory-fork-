@@ -157,7 +157,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -248,6 +248,8 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    // The wave size the code declares (0: none).
+    word(&mut out, s.wave_size.unwrap_or(0));
     out
 }
 
@@ -316,6 +318,10 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let wave_size = match r.word()? {
+        0 => None,
+        n => Some(n),
+    };
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -326,6 +332,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
+        wave_size,
     })
 }
 
@@ -354,6 +361,7 @@ mod tests {
             root_srvs: vec![0, 3],
             root_uavs: vec![1],
             root_indexed_views: vec![RootIndexedView {
+            wave_size: None,
                 table_slot: 1,
                 constant_slot: 2,
                 constant_dword: 3,
