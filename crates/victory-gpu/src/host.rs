@@ -2604,7 +2604,10 @@ fn relay_hand_back(back: &[Declared]) {
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
     // Merge adjacent pieces: one kernel read/write per run, not per 64 KiB
-    // piece (see `Shadow::copy_back_with`).
+    // piece (see `Shadow::copy_back_with`). Short runs are joined to their
+    // neighbours too, with `VICTORY_COPYBACK_SMALL=1`: a run costs what a
+    // 64 KiB one does, whatever its size.
+    let short = crate::shadow::merge_small_runs();
     let merged: Vec<BackRun> = work
         .iter()
         .enumerate()
@@ -2616,6 +2619,9 @@ fn relay_hand_back(back: &[Declared]) {
                     Some(last) if last.0 + last.1 == at => last.1 += n,
                     _ => merged.push((at, n)),
                 }
+            }
+            if short {
+                merged = crate::shadow::merge_short_runs(merged);
             }
             merged.into_iter().map(move |(at, n)| (span, shadow.clone(), at, n))
         })
@@ -2630,6 +2636,13 @@ fn relay_hand_back(back: &[Declared]) {
             .map(|_| std::sync::atomic::AtomicUsize::new(0))
             .collect(),
     );
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::BackPieces, merged.len() as u64);
+        add(C::BackJobs, merged.len() as u64);
+        add(C::BackBatches, 1);
+    }
     let groups = if wide_hand_back() { merged.len().div_ceil(4).min(8) } else { 1 };
     let jobs: Vec<crate::shadow::Job> = runs_by_copy(merged, groups)
         .into_iter()
@@ -2916,6 +2929,13 @@ fn hand_back(back: &[Declared]) {
                 merged.into_iter().map(move |(at, n)| (span, shadow.clone(), at, n))
             })
             .collect();
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::BackPieces, runs.len() as u64);
+            add(C::BackJobs, runs.len() as u64);
+            add(C::BackBatches, 1);
+        }
         let written = merge_runs(runs, work.len());
         for ((_, _from, _to), written) in work.iter().zip(written) {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
@@ -3474,8 +3494,10 @@ impl Host {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
         };
-        let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
-        let mut total = 0u64;
+        // ([`Host::card_back`]'s joins happen before the offsets in the
+        // fetched buffer are given, for the same reason: a join grows a
+        // span, and what lies behind it in the buffer moves.)
+        let mut found: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         if let Some((differs, dwords)) = differs {
             // SAFETY: the mapping of the results. The compares of these
             // plans have run, and their dwords are given to no other plan
@@ -3502,12 +3524,41 @@ impl Host {
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo < hi && seen.insert((copy, lo, hi)) {
-                            pieces.push((r.shadow.clone(), lo, hi, total));
-                            total += (hi - lo) as u64;
+                            found.push((r.shadow.clone(), lo, hi));
                         }
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                 }
+            }
+        }
+        // A run costs a kernel read and a write whatever its size
+        // (`Shadow::card_merge_relay`), so pieces that touch are one run,
+        // and with `VICTORY_COPYBACK_SMALL=1` those within 4 KiB as well.
+        //
+        // The order the pieces came in is kept, and a span only joins the
+        // one just before it: flights land in the order of [`LINE`] so that
+        // a later flight's results never reach title memory before an
+        // earlier flight's, and sorting the spans would lose that. A span
+        // that starts before the one before it (ranges of one plan are in
+        // the order the title declared them, not by address) is no join.
+        let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
+        let mut total = 0u64;
+        {
+            let close = crate::shadow::card_join_gap();
+            let mut joined: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::with_capacity(found.len());
+            for (shadow, lo, hi) in found {
+                match joined.last_mut() {
+                    Some(last)
+                        if std::sync::Arc::ptr_eq(&last.0, &shadow) && lo >= last.2 && last.2 + close >= lo =>
+                    {
+                        last.2 = last.2.max(hi);
+                    }
+                    _ => joined.push((shadow, lo, hi)),
+                }
+            }
+            for (shadow, lo, hi) in joined {
+                pieces.push((shadow, lo, hi, total));
+                total += (hi - lo) as u64;
             }
         }
         if pieces.is_empty() {
@@ -3764,8 +3815,9 @@ impl Host {
         // The pieces to fetch: which plan and range, the offsets in the
         // copy, and where the bytes come down. One fetch for every plan: a
         // flight's pieces wait for the card once, together.
-        let mut pieces: Vec<(usize, usize, usize, usize, u64)> = Vec::new();
-        let mut total = 0u64;
+        // (a piece's place in the fetched buffer is given after the joins
+        // below: a join grows a piece, and the bytes after it move.)
+        let mut found: Vec<(usize, usize, usize, usize)> = Vec::new();
         for (k, plan) in plans.iter().enumerate() {
             for (i, r) in plan.ranges.iter().enumerate() {
                 for p in 0..r.span.pieces {
@@ -3774,12 +3826,38 @@ impl Host {
                     }
                     let (lo, hi) = r.shadow.card_piece(&r.span, p);
                     if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
-                        pieces.push((k, i, lo, hi, total));
-                        total += (hi - lo) as u64;
+                        found.push((k, i, lo, hi));
                     }
                 }
                 crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
             }
+        }
+        // A run costs a kernel read and a write whatever its size
+        // (`Shadow::card_merge`), and the compare fetches by 64 KiB piece:
+        // two pieces with a word written in each were two runs at two
+        // kernel calls. Pieces that touch are one run, always (`hand_back`
+        // has always joined them; this path never did, so a buffer written
+        // all over was a kernel call per 64 KiB). With
+        // `VICTORY_COPYBACK_SMALL=1` the runs that only fall close together
+        // are joined too, and the bytes between them go to title memory as
+        // they already are (the merge writes the copy's bytes only where
+        // the card changed them).
+        {
+            let close = crate::shadow::card_join_gap();
+            let mut joined: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(found.len());
+            for (k, i, lo, hi) in found {
+                match joined.last_mut() {
+                    Some(last) if last.0 == k && last.1 == i && last.3 + close >= lo => last.3 = hi,
+                    _ => joined.push((k, i, lo, hi)),
+                }
+            }
+            found = joined;
+        }
+        let mut pieces: Vec<(usize, usize, usize, usize, u64)> = Vec::with_capacity(found.len());
+        let mut total = 0u64;
+        for (k, i, lo, hi) in found {
+            pieces.push((k, i, lo, hi, total));
+            total += (hi - lo) as u64;
         }
         let mut written: Vec<Vec<usize>> =
             plans.iter().map(|plan| vec![0usize; plan.ranges.len()]).collect();
@@ -5386,7 +5464,12 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_copy(dst, len);
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    // Both sides are title memory here (`Step::Copy` is the
+                    // runtime's copy from one place of its memory to
+                    // another).
+                    if !copy_title_to_title(dst as *mut u8, src as *const u8, len) {
+                        copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    }
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     len
@@ -5654,15 +5737,227 @@ impl Batch {
     }
 }
 
+/// Whether a bulk read of title memory copies it directly (`memcpy`) when
+/// its pages are there, instead of asking the kernel. On by default;
+/// `VICTORY_DIRECT_READ=0` keeps the kernel's `ReadProcessMemory` for
+/// every read, as before.
+fn direct_reads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_READ").is_none_or(|v| v != "0"))
+}
+
+/// Bytes [`direct_read`] copied since the last frame line, and the reads it
+/// left to the kernel because a page was not there.
+pub(crate) static DIRECT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DIRECT_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Bytes [`write_mapped`] wrote directly into title memory since the last
+/// frame line.
+pub(crate) static DIRECT_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Reads a frame that were too long to ask about, and so went the kernel's
+/// way without being asked (see [`direct_read`]).
+pub(crate) static DIRECT_TOO_LONG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Microseconds spent asking [`crate::texture::committed`] whether a copy's
+/// pages are there, since the last frame line. The probes it makes are
+/// kernel calls of their own; they are counted apart from the copying so
+/// that "a call's cost" means the copy and not the asking.
+pub(crate) static ASKING_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Bytes copied straight from title memory into title memory since the last
+/// frame line (counted in [`DIRECT_BYTES`] as well).
+pub(crate) static DIRECT_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// Set while this thread holds title memory's read side for a direct
+    /// copy.
+    static READING_NOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Title memory's read side for a direct copy, taken once a thread: the
+/// inner `Option` is `None` on a thread that already had it, so that the
+/// `RwLock` is not taken twice ([`crate::watch::title_memory_reading_now`]).
+struct Reading(Option<crate::watch::Reading>);
+
+impl Reading {
+    fn take() -> Option<Reading> {
+        let already = READING_NOW.with(|r| r.replace(true));
+        if already {
+            return Some(Reading(None));
+        }
+        match crate::watch::title_memory_reading_now() {
+            Some(r) => Some(Reading(Some(r))),
+            None => {
+                READING_NOW.with(|r| r.set(false));
+                None
+            }
+        }
+    }
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        if let Some(r) = self.0.take() {
+            drop(r);
+            READING_NOW.with(|now| now.set(false));
+        }
+    }
+}
+
+/// Reads title memory at `src` into `dst` (`len` bytes) by copying it
+/// directly, as `memcpy` would, when every page of it can be read; false
+/// otherwise (the caller takes the kernel's way).
+///
+/// The memory is this process's own (the runtime's `XMemVirtualAlloc`
+/// sections), so the kernel's copy moves nothing a copy could not: it is
+/// paying the syscall, and under Wine the syscall is the wineserver. The
+/// frame line's "copies" was 201.6 MB in 3627 ms a frame, 55 MB/s, where a
+/// `memcpy` of the same pages runs at 10-20 GB/s.
+///
+/// The question asked is `crate::texture::committed`, the same one a direct
+/// write asks of its destination and for the same reason: it is what works
+/// under Wine. `K32QueryWorkingSetEx` alone answers a different question —
+/// bit 0 says whether the page is in the *working set*, and a page that is
+/// committed and has never been touched is not, though reading it is
+/// perfectly safe. A cold title buffer is mostly such pages, so asking only
+/// that sent every read back to the kernel: 2,745 refusals a frame and
+/// 0.0 MB copied, with the writes, whose pages had just been written, at
+/// 50.6 MB. `committed` asks a byte through the kernel where the working
+/// set does not know, which both answers the question and warms the page.
+fn direct_read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    // A read of title memory in place must not cross a remap.
+    //
+    // A caller may already hold the read side (`crate::texture`'s refresh
+    // reads title memory in place and takes it; that read does not go
+    // through here today, but a later one might). `std::sync::RwLock` may
+    // not be taken twice by one thread — it can deadlock — so a thread's
+    // first taking is noted and a second is not taken.
+    let Some(_reading) = Reading::take() else {
+        return false;
+    };
+    // The asking costs a page-table walk in batches, and one byte through
+    // the kernel for each page the working set does not know. On a cold run
+    // of 1.5 MB that is 384 syscalls to save one, so a run longer than
+    // `ASK_LIMIT` is not asked about at all: it takes the kernel's way,
+    // which is one call. Most runs are far shorter — the copies read
+    // 83-201 MB in 2,700 calls a frame, 30-75 KiB each.
+    //
+    // (Not sampled: a page in the middle that is gone would fault the copy,
+    // and a fault in memcpy is the process's.)
+    //
+    // The limit is the price of asking, and asking is what the limit
+    // reasons about: a range the runtime's own table answers
+    // (`crate::inplace::committed_known`) costs no kernel call whatever its
+    // length, so it is not held to it. 30-66 runs of 256 KiB to 1 MiB a
+    // frame were going the kernel's way for the asking alone.
+    const ASK_LIMIT: usize = 256 << 10;
+    // Over the limit only the table is asked: what the limit guards against
+    // is the price of asking, and a range the runtime's own record answers
+    // costs nothing. Up to it `crate::texture::committed` asks the table
+    // first and the kernel only for what the table does not know, so the
+    // range is asked about once and counted once.
+    if len > ASK_LIMIT && !crate::inplace::committed_known(src as usize, len) {
+        DIRECT_TOO_LONG.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let asked = std::time::Instant::now();
+    let there = crate::texture::committed(src, len);
+    ASKING_US.fetch_add(asked.elapsed().as_micros() as u64, Ordering::Relaxed);
+    if !there {
+        DIRECT_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    // SAFETY: every page of the source was found readable; the destination
+    // is the caller's mapped host memory, and the ranges do not overlap.
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+    DIRECT_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+    true
+}
+
+/// The most bytes a copy of title memory into title memory is asked about
+/// before it is copied directly (see [`copy_title_to_title`]): beyond this
+/// the two questions cost more than the one kernel call they would save.
+const TITLE_COPY_ASK: usize = 1 << 20;
+
+/// Whether `[dst, dst+len)` and `[src, src+len)` are both readable: the
+/// same question a direct read asks (`crate::texture::committed`, a batched
+/// working-set query and a one-byte probe where that cannot say), of both
+/// sides.
+fn both_readable(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    // `TITLE_COPY_ASK` is the price of asking, and asking is what it
+    // reasons about: a range the runtime's own record answers
+    // (`crate::inplace::committed_known`) costs no kernel call whatever its
+    // length, so past the cap only the table is asked, and both sides must
+    // be known there. Up to the cap the question goes through
+    // `crate::texture::committed`, which asks the table first itself and
+    // the kernel only for what the table does not know — so each side is
+    // asked exactly once, and the frame line counts each byte once.
+    if len > TITLE_COPY_ASK {
+        return crate::inplace::committed_known(src as usize, len)
+            && crate::inplace::committed_known(dst as usize, len);
+    }
+    let asked = std::time::Instant::now();
+    let both = crate::texture::committed(src, len) && crate::texture::committed(dst, len);
+    ASKING_US.fetch_add(asked.elapsed().as_micros() as u64, Ordering::Relaxed);
+    both
+}
+
+/// A copy from title memory into title memory, both sides this process's
+/// own bytes: a plain copy when both are readable, `false` when the caller
+/// must take the kernel's way (a page of either side is not there).
+///
+/// This is where the `copies` line's bytes went. A `Step::Copy` is the
+/// runtime's own copy from one place of its memory to another, so its
+/// destination is title memory; `copy_mapped` was called with `title_dst`,
+/// which no direct way covered, so every one of these went through the
+/// wineserver. The line read 102-161 MB a frame while the direct read saw
+/// 0.2-11 MB of it, and the largest single cost of the frame was two ranges
+/// of our own address space being moved by a syscall.
+pub(crate) fn copy_title_to_title(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    if !direct_reads() || len == 0 {
+        return false;
+    }
+    // The reading side for the copy, as [`direct_read`] takes it: the
+    // runtime must not unmap a page of `src` (nor of `dst`, which it holds
+    // under the same lock) mid-copy. This mattered little while the direct
+    // way took 0.1 MB a frame; with the runtime's own table answering for
+    // whole runs it is the copy of nearly all of them.
+    let Some(_reading) = Reading::take() else {
+        return false;
+    };
+    if !both_readable(dst, src, len) {
+        return false;
+    }
+    // The destination is written behind the watch's back: the guards open
+    // and the placed textures there change, exactly as the kernel's way
+    // does before `read` (`copy_mapped`). Then [`run_deferred`]'s
+    // `watch::wrote` sees the pages as written after this submission's
+    // asking, as it does for every other step.
+    crate::watch::writing(dst as usize, len);
+    // SAFETY: both sides were found readable and are this process's own
+    // memory; the runtime's copies are between distinct allocations.
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+    DIRECT_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+    DIRECT_COPIES.fetch_add(len as u64, Ordering::Relaxed);
+    true
+}
+
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
 /// destination (`title_dst`) that is not all mapped is left alone.
 ///
 /// The source is read through the kernel (`ReadProcessMemory`), which
-/// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
-/// cost about 2 ms per copy in the title's big pools (it walks the page
-/// tables to the region's end), which made copies run at 100-200 MB/s.
+/// reports an unmapped page instead of faulting; a whole read of title
+/// memory whose pages are all there is copied directly instead
+/// ([`direct_read`]). Asking `VirtualQuery` first cost about 2 ms per copy
+/// in the title's big pools (it walks the page tables to the region's end),
+/// which made copies run at 100-200 MB/s; asking the pages instead costs a
+/// page-table walk too, but 256 pages at a time and only for the pages the
+/// copy holds.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -5696,7 +5991,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let whole = if !title_dst && direct_reads() && direct_read(src, dst, len) {
+        true
+    } else {
+        read(src, dst, len)
+    };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -5820,6 +6119,21 @@ fn direct_writes() -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // The same way round as `direct_read`: the destination is this
+    // process's own title memory, and a write whose pages are all there
+    // needs no syscall. `crate::watch::writing` (the caller's) has opened
+    // the guarded blocks already, so what is asked here is only whether
+    // the pages are committed and readable: a page that is not there is
+    // written page by page through the kernel below, as before.
+    // (the asking is a page-table walk itself: only worth it for a run
+    // many pages long, which is what a copy-back run is)
+    if direct_reads() && len >= 64 << 10 && crate::texture::committed(dst, len) {
+        // SAFETY: every page of the destination was found committed and
+        // readable, and the source is the caller's host memory.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+        DIRECT_WRITES.fetch_add(len as u64, Ordering::Relaxed);
+        return;
+    }
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
@@ -6031,6 +6345,32 @@ impl Meter {
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
         });
+        // How much of the "copies" and of the putting back went the direct
+        // way (`memcpy`) instead of the kernel's ReadProcessMemory and
+        // NtWriteVirtualMemory.
+        {
+            let read = DIRECT_BYTES.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
+            let wrote = DIRECT_WRITES.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
+            let refused = DIRECT_REFUSED.swap(0, Ordering::Relaxed) as f64 / frames;
+            let long = DIRECT_TOO_LONG.swap(0, Ordering::Relaxed) as f64 / frames;
+            let ask = ASKING_US.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+            let title = DIRECT_COPIES.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
+            // What the runtime's own table answered, so that a frame line
+            // says whether the kernel was asked at all.
+            let known_mb = crate::inplace::KNOWN_BYTES.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
+            let known = crate::inplace::KNOWN_CALLS.swap(0, Ordering::Relaxed) as f64 / frames;
+            let missed = crate::inplace::KNOWN_MISSED.swap(0, Ordering::Relaxed) as f64 / frames;
+            if read > 0.0 || wrote > 0.0 || refused > 0.0 || long > 0.0 || title > 0.0 || known > 0.0 {
+                tracing::info!(
+                    "  copied without the kernel, per frame: {read:.1} MB read into host memory ({title:.1} MB of it \
+                     title memory into title memory) and {wrote:.1} MB written into title memory, as `memcpy` \
+                     (VICTORY_DIRECT_READ=0 keeps the kernel's way); {ask:.1} ms asking whether the pages were \
+                     there; {refused:.0} reads a frame left to the kernel (a page could not be read), {long:.0} were \
+                     over the most that is asked about; the runtime's own table answered {known:.0} questions a frame \
+                     ({known_mb:.1} MB) and knew nothing of {missed:.0} (VICTORY_KNOWN_MEMORY=0 asks the kernel as before)"
+                );
+            }
+        }
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
@@ -6155,6 +6495,38 @@ impl Meter {
                     per_frame(5),
                     per_frame(6) / 1e3
                 );
+                // Where "copying back" goes on a card with copies of its
+                // own: a run costs a kernel read, a write and a note of the
+                // write, and what a run's size is does not change that, so
+                // the count of runs is the count of kernel calls.
+                use crate::shadow::card_stat;
+                let runs = card[card_stat::RUNS];
+                if runs > 0 {
+                    // Every run reads title memory; only those the card
+                    // changed something in are written back.
+                    let writes = card[card_stat::WRITES];
+                    let calls = runs + writes;
+                    let kernel_us = (card[card_stat::READ_US] + card[card_stat::WRITE_US]) as f64;
+                    // What the runs cover, against the bytes fetched: a run
+                    // is what a kernel call costs, so a frame that fetches a
+                    // lot and puts back a little in few runs has met the
+                    // floor, and one that puts back a lot in many runs is
+                    // paying per run and not per byte.
+                    let per_run = card[card_stat::BYTES] as f64 / runs as f64 / 1024.0;
+                    tracing::info!(
+                        "  the pieces put back, per frame: {:.0} runs with a byte that differs ({:.1} KiB a run), \
+                         {:.0} kernel reads and {:.0} kernel writes ({:.2} ms a call, {:.1} ms in all), the byte \
+                         merge between them {:.1} ms (VICTORY_COPYBACK_SMALL=1 joins runs under 4 KiB, \
+                         VICTORY_COPYBACK_GAP bytes takes any gap)",
+                        runs as f64 / frames,
+                        per_run,
+                        card[card_stat::READS] as f64 / frames,
+                        writes as f64 / frames,
+                        if calls > 0 { kernel_us / 1e3 / calls as f64 } else { 0.0 },
+                        kernel_us / 1e3 / frames,
+                        card[card_stat::MERGE_US] as f64 / 1e3 / frames
+                    );
+                }
             }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \

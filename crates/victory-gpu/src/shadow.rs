@@ -163,13 +163,35 @@ static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
-/// bytes; the waits for the card the fetches added and their microseconds.
-pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// bytes; the waits for the card the fetches added and their microseconds;
+/// and, since the pieces put back cost what a run costs and not what a
+/// byte costs, the runs, the kernel's calls and the merge between them.
+///
+/// These are counted always, not only with the `diagnostics` feature: the
+/// frame's largest cost without the swapchain in the way is this one, and
+/// it was invisible in a plain build.
+pub(crate) static CARD_STATS: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
+
+/// The indices of [`CARD_STATS`] the putting back of pieces uses.
+pub(crate) mod card_stat {
+    /// Runs given to `card_merge` (a piece or several joined).
+    pub(crate) const RUNS: usize = 10;
+    /// The kernel's reads of title memory, and their microseconds.
+    pub(crate) const READS: usize = 11;
+    pub(crate) const READ_US: usize = 12;
+    /// The kernel's writes into title memory, and their microseconds.
+    pub(crate) const WRITES: usize = 13;
+    pub(crate) const WRITE_US: usize = 14;
+    /// The byte-by-byte merge between them.
+    pub(crate) const MERGE_US: usize = 15;
+    /// Bytes the runs cover, read and written whatever their size.
+    pub(crate) const BYTES: usize = 16;
+}
 
 /// [`CARD_STATS`], taken; then the copies in the card's memory, their
 /// bytes and their "before" twins' bytes.
-pub(crate) fn card_stats() -> [u64; 10] {
-    let mut out = [0u64; 10];
+pub(crate) fn card_stats() -> [u64; 17] {
+    let mut out = [0u64; 17];
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
@@ -1052,6 +1074,81 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 /// About this many bytes to a piece of work for [`wide`].
 const WIDE_JOB: usize = 1 << 20;
 
+/// `VICTORY_COPYBACK_SMALL=1`: runs shorter than [`SMALL_RUN`] are merged
+/// with the runs around them before title memory is touched.
+///
+/// Every run costs a kernel read of title memory, a kernel write into it,
+/// and the journal's note of the write — some 2 ms on Wine/vkd3d whatever
+/// the run's size (hundreds of runs at ~2 ms were seconds a frame). A run
+/// of a few bytes (a shader setting a counter) then costs as much as a
+/// 64 KiB piece, and the few hundred runs a heavy frame come out to the
+/// frame's largest cost. Between two such runs the bytes in between are
+/// read and written too, and the loop below puts title memory's own bytes
+/// back wherever the copy did not change, so nothing there is lost; what
+/// it costs is the read and the write of a few KiB.
+///
+/// Off by default: the extra bytes reach title memory and the title's
+/// write-watch, which is a thing to measure before it is relied on.
+pub(crate) fn merge_small_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPYBACK_SMALL").is_some_and(|v| v == "1"))
+}
+
+/// Runs shorter than this are merged with their neighbours under
+/// [`merge_small_runs`].
+const SMALL_RUN: usize = 4 << 10;
+
+/// How far apart two pieces of a copy in the card's memory may be and still
+/// go back as one run, without being asked ([`card_join_gap`]).
+pub(crate) const SMALL_GAP: usize = 4 << 10;
+
+/// `VICTORY_COPYBACK_GAP`: how far apart two pieces of a copy in the card's
+/// memory may be and still be fetched and put back as one run, in bytes
+/// (`4096`, `64k`, `1m`). Unset: nothing, or 4 KiB with
+/// `VICTORY_COPYBACK_SMALL=1`.
+///
+/// The gap costs bytes and saves runs, and a run costs the kernel a read
+/// and a write whatever its size: a frame of 1,500 runs of 64 KiB and a
+/// frame of 60 runs of 2 MB hold the same bytes and are seconds apart. The
+/// knob is what tells the two apart in one build. `1073741824` joins every
+/// piece of a copy into one run, which is the extreme to measure against.
+pub(crate) fn card_join_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        let Some(raw) = std::env::var("VICTORY_COPYBACK_GAP").ok() else {
+            return if merge_small_runs() { SMALL_GAP } else { 0 };
+        };
+        let raw = raw.trim().to_ascii_lowercase();
+        let (digits, scale) = match raw.strip_suffix('k') {
+            Some(d) => (d, 1usize << 10),
+            None => match raw.strip_suffix('m') {
+                Some(d) => (d, 1usize << 20),
+                None => (raw.as_str(), 1usize),
+            },
+        };
+        digits.parse::<usize>().map(|n| n.saturating_mul(scale)).unwrap_or(0)
+    })
+}
+
+/// `runs` (offsets into a copy, in order, disjoint) with every run shorter
+/// than [`SMALL_RUN`] joined to the run before it: the bytes between them
+/// go to title memory as it has them (`copy_back_run_with` writes the
+/// copy's bytes only where the GPU changed them, and the title's
+/// elsewhere), so the run is right, only wider.
+pub(crate) fn merge_short_runs(runs: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for (at, n) in runs {
+        match out.last_mut() {
+            // (adjacent or a short run either side of the gap)
+            Some(last) if last.0 + last.1 == at || n < SMALL_RUN || last.1 < SMALL_RUN => {
+                last.1 = at + n - last.0;
+            }
+            _ => out.push((at, n)),
+        }
+    }
+    out
+}
+
 /// With [`wide_back`]: the snapshots noted while a submission is prepared
 /// (from, to, bytes), taken by [`take_snapshots`].
 static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
@@ -1926,14 +2023,24 @@ impl Shadow {
         let (at, n) = (at + first, last + 1 - first);
         let (host, old) = (&mut host[first..=last], &old[first..=last]);
         let mut title = vec![0u8; n];
+        #[cfg(feature = "diagnostics")]
+        let kernel = std::time::Instant::now();
         if !crate::host::read_into((start + at) as *const u8, &mut title) {
             return 0;
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::BackKernelCalls, 1);
+            add(C::BackKernelUs, kernel.elapsed().as_micros() as u64);
         }
         // Title memory with the GPU's bytes put in; the copy takes the
         // title's bytes in turn. Without a branch, so the loop runs many
         // bytes at a time: the GPU's byte where the copy's byte is not what
         // it was before the submission, else the title's. (With the two
         // searches above this was 44 ms a frame for 970 pieces.)
+        #[cfg(feature = "diagnostics")]
+        let merging = std::time::Instant::now();
         let mut differs = 0u8;
         for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
             let gpu = if *h != *o { 0xffu8 } else { 0 };
@@ -1942,11 +2049,28 @@ impl Shadow {
             *t = merged;
             *h = merged;
         }
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::BackMergeUs, merging.elapsed().as_micros() as u64);
+            add(C::BackRuns, 1);
+        }
         if differs == 0 {
             return 0;
         }
+        // The kernel's write of title memory: this is the time that a piece
+        // landing in title memory costs, and most runs cost it.
+        #[cfg(feature = "diagnostics")]
+        let writing = std::time::Instant::now();
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::BackLanded, 1);
+            add(C::BackKernelCalls, 1);
+            add(C::BackKernelUs, writing.elapsed().as_micros() as u64);
+        }
         n
     }
 
@@ -1988,6 +2112,12 @@ impl Shadow {
                     }
                 }
                 merged
+            };
+            // Short runs cost what long ones do (`merge_small_runs`).
+            let differing = if merge_small_runs() {
+                merge_short_runs(differing)
+            } else {
+                differing
             };
             #[cfg(feature = "diagnostics")]
             let syncing = {
@@ -2621,12 +2751,21 @@ impl Shadow {
         let last = last_difference(gpu, old).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
+        CARD_STATS[card_stat::RUNS].fetch_add(1, Ordering::Relaxed);
+        CARD_STATS[card_stat::BYTES].fetch_add(n as u64, Ordering::Relaxed);
         title.clear();
         title.resize(n, 0);
         let mut written = 0;
-        if crate::host::read_into((start + at) as *const u8, title) {
+        // (counted always: this is the frame's largest cost without the
+        // swapchain in the way, and a plain build saw none of it.)
+        let reading = std::time::Instant::now();
+        let read = crate::host::read_into((start + at) as *const u8, title);
+        CARD_STATS[card_stat::READS].fetch_add(1, Ordering::Relaxed);
+        CARD_STATS[card_stat::READ_US].fetch_add(reading.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if read {
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
+            let merging = std::time::Instant::now();
             let mut differs = 0u8;
             for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
                 let wrote = if *g != *o { 0xffu8 } else { 0 };
@@ -2635,9 +2774,17 @@ impl Shadow {
                 *t = merged;
                 *o = merged;
             }
+            CARD_STATS[card_stat::MERGE_US].fetch_add(merging.elapsed().as_micros() as u64, Ordering::Relaxed);
             if differs != 0 {
+                let writing = std::time::Instant::now();
                 crate::watch::writing(start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                // (`write_mapped` asks whether the pages are there before it
+                // copies directly, and `ASKING_US` counts that asking apart,
+                // so a run's time here is the copy and the asking together;
+                // the line says which of the two the frame spent.)
+                CARD_STATS[card_stat::WRITE_US].fetch_add(writing.elapsed().as_micros() as u64, Ordering::Relaxed);
+                CARD_STATS[card_stat::WRITES].fetch_add(1, Ordering::Relaxed);
                 written = n;
             }
         } else {
@@ -2688,6 +2835,8 @@ impl Shadow {
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
+        CARD_STATS[card_stat::RUNS].fetch_add(1, Ordering::Relaxed);
+        CARD_STATS[card_stat::BYTES].fetch_add(n as u64, Ordering::Relaxed);
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
@@ -2700,7 +2849,11 @@ impl Shadow {
         };
         title.clear();
         title.resize(n, 0);
+        let reading = std::time::Instant::now();
         let mapped = crate::host::read_into((start + at) as *const u8, title);
+        CARD_STATS[card_stat::READS].fetch_add(1, Ordering::Relaxed);
+        CARD_STATS[card_stat::READ_US].fetch_add(reading.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let merging = std::time::Instant::now();
         let mut changed = false;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
@@ -2708,11 +2861,15 @@ impl Shadow {
             // the card wrote, as before; `title` is scratch then.
             changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
         }
+        CARD_STATS[card_stat::MERGE_US].fetch_add(merging.elapsed().as_micros() as u64, Ordering::Relaxed);
         if !mapped || !changed {
             return 0;
         }
+        let writing = std::time::Instant::now();
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        CARD_STATS[card_stat::WRITE_US].fetch_add(writing.elapsed().as_micros() as u64, Ordering::Relaxed);
+        CARD_STATS[card_stat::WRITES].fetch_add(1, Ordering::Relaxed);
         n
     }
 }
@@ -3253,4 +3410,62 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod short_run_tests {
+    use super::{SMALL_RUN, merge_short_runs};
+
+    /// Every byte the input covers, the output covers (a merged run also
+    /// covers the bytes between the runs it joined, which is the point).
+    fn covers(input: &[(usize, usize)], output: &[(usize, usize)]) -> bool {
+        let mut got = vec![false; 1 << 20];
+        for &(at, n) in output {
+            got[at..at + n].fill(true);
+        }
+        input.iter().all(|&(at, n)| got[at..at + n].iter().all(|&b| b))
+    }
+
+    /// And no output run reaches past the last byte of the input.
+    fn contained(input: &[(usize, usize)], output: &[(usize, usize)]) -> bool {
+        let end = input.iter().map(|&(at, n)| at + n).max().unwrap_or(0);
+        output.iter().all(|&(at, n)| at + n <= end)
+    }
+
+    #[test]
+    fn short_runs_join_their_neighbours_and_long_ones_stay() {
+        let long = SMALL_RUN * 2;
+        // two tiny runs (a shader setting a counter) far apart, and one long
+        let input = vec![(0x100, 4), (0x1000, 8), (0x8000, long), (0x20000, 4)];
+        let out = merge_short_runs(input.clone());
+        assert!(covers(&input, &out), "every byte the input covers, the output covers: {out:?}");
+        assert!(contained(&input, &out), "and nothing past its end: {out:?}");
+        assert!(out.len() < input.len(), "fewer runs than in: {out:?}");
+    }
+
+    #[test]
+    fn adjacent_runs_still_join_and_order_is_kept() {
+        let input = vec![(0, 16), (16, 32), (64, 8)];
+        let out = merge_short_runs(input.clone());
+        assert!(covers(&input, &out));
+        assert!(out.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0), "in order, disjoint: {out:?}");
+    }
+
+    #[test]
+    fn a_short_run_joins_the_one_before_it() {
+        // A short run between two long ones goes to the first: the gap
+        // between them is written with the title's own bytes.
+        let input = vec![(0, SMALL_RUN * 2), (SMALL_RUN * 4, 4), (SMALL_RUN * 8, SMALL_RUN * 2)];
+        let out = merge_short_runs(input.clone());
+        assert!(covers(&input, &out));
+        assert!(contained(&input, &out));
+        assert_eq!(out, vec![(0, SMALL_RUN * 4 + 4), (SMALL_RUN * 8, SMALL_RUN * 2)]);
+    }
+
+    #[test]
+    fn long_runs_apart_stay_apart() {
+        let input = vec![(0, SMALL_RUN * 2), (SMALL_RUN * 8, SMALL_RUN * 2)];
+        let out = merge_short_runs(input.clone());
+        assert_eq!(out, input);
+    }
 }

@@ -972,6 +972,10 @@ impl Memory {
             NonNull::new(alloc(layout.size(), attributes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
         // SAFETY: the allocator handed out `size` bytes.
         unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
+        // Committed and readable for as long as `self` lives: the copies
+        // ask this instead of the kernel (`crate::inplace::committed_known`).
+        #[cfg(windows)]
+        crate::inplace::title_memory_given(ptr.as_ptr() as usize, layout.size());
         Ok(Memory {
             ptr,
             layout,
@@ -1003,6 +1007,8 @@ impl Memory {
         if info.size >= 32 << 20 {
             tracing::info!(mb = info.size >> 20, at = ?ptr, "memory for the title from our allocator (a heap or a descriptor heap)");
         }
+        #[cfg(windows)]
+        crate::inplace::title_memory_given(ptr.as_ptr() as usize, layout.size());
         Ok(Memory {
             ptr,
             layout,
@@ -1013,6 +1019,11 @@ impl Memory {
 
 impl Drop for Memory {
     fn drop(&mut self) {
+        // Before the free, never after: a range the table still holds would
+        // be answered "committed" once the memory is gone, and the copy
+        // that trusted it would fault.
+        #[cfg(windows)]
+        crate::inplace::title_memory_taken(self.ptr.as_ptr() as usize, self.layout.size());
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
             // SAFETY: allocated in `new` with this layout.

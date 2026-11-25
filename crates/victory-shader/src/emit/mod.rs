@@ -579,7 +579,14 @@ fn widen(
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
-                eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
+                // (what a form for several waves would have to do: this one is
+                // only written for a group that is one console wave)
+                eprintln!(
+                    "WAVE64-WIDE not tried: thread groups of {:?}, {} console waves, LDS {} bytes",
+                    cs.threads,
+                    cs.threads.iter().product::<u32>().div_ceil(64),
+                    cs.lds_bytes()
+                );
             }
             return Err(NOT);
         }
