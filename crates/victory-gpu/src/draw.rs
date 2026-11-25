@@ -1314,27 +1314,67 @@ impl State {
         // Per host heap: the host copy and range each slot's buffer view
         // reads, kept from pass to pass. Only the slots written since the
         // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
+        // at best); a view of a released resource goes stale without a
+        // write, and a slot written before its memory had a host copy is
+        // only made when its slot is looked at, so the whole list is swept
+        // too: a slice of it each pass (`Sweep`), never all of it at once.
         type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
         static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
             std::sync::Mutex::new(None);
+        /// The slots of a whole sweep, cut into slices: one slice is looked
+        /// at each pass. A whole sweep in one pass cost 760-1676 ms on
+        /// Wine/vkd3d (83k slots, run after run), a spike the frame never
+        /// got back; a slice costs a few ms a pass, and a stale view is
+        /// caught a few passes later (its span is refreshed until then, so
+        /// nothing draws from it unwatched).
+        #[derive(Default)]
+        struct Sweep {
+            slots: Vec<u32>,
+            /// Where the next slice starts; `slots.len()`: cut a new one.
+            next: usize,
+        }
+        static SWEEPS: std::sync::Mutex<Option<std::collections::HashMap<usize, Sweep>>> =
+            std::sync::Mutex::new(None);
+        /// Slots a pass looks at in a sweep (some 8,000 of 83,000: the whole
+        /// list once in ten passes, far sooner than the sixty-four passes a
+        /// full scan ran every).
+        const SLICE: usize = 8 << 10;
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
         let (passes, ranges) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
-        let changed = host.buffer_changes();
-        // Every 64 passes (was 16): a full scan of 83k slots cost
-        // 760-1600 ms on Wine/vkd3d; stale views are still caught, just
-        // later (a released resource's span is refreshed until then).
-        let slots = if *passes % 64 == 0 {
-            ranges.clear();
-            host.buffer_slots()
-        } else {
-            changed
-        };
+        let mut slots = host.buffer_changes();
+        {
+            let mut sweeps = SWEEPS.lock().unwrap_or_else(|e| e.into_inner());
+            let sweep = sweeps
+                .get_or_insert_with(Default::default)
+                .entry(std::ptr::from_ref(host) as usize)
+                .or_default();
+            if *passes == 0 {
+                // The first pass makes every view ready at once (the level's
+                // views must all read something before its first draw).
+                ranges.clear();
+                sweep.slots = host.buffer_slots();
+                sweep.next = sweep.slots.len();
+                slots = sweep.slots.clone();
+            } else {
+                // Once in sixty-four passes, the kept ranges start over: a
+                // slot that leaves the list (its view gone) is then not
+                // refreshed for ever on the strength of an old entry. (The
+                // slots themselves come a slice at a time, not all at once.)
+                if *passes % 64 == 1 {
+                    ranges.clear();
+                }
+                if sweep.next >= sweep.slots.len() {
+                    sweep.slots = host.buffer_slots();
+                    sweep.next = 0;
+                }
+                let end = (sweep.next + SLICE).min(sweep.slots.len());
+                slots.extend_from_slice(&sweep.slots[sweep.next..end]);
+                sweep.next = end;
+            }
+        }
         *passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
