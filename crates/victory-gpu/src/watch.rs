@@ -79,10 +79,9 @@ pub(crate) fn take_kernel_stats() -> (u64, u64, u64, u64) {
 }
 
 /// Ranges of one submission closer than this are asked about together:
-/// walking the pages between them costs less than another kernel call (a
-/// call that resets written pages costs 30-70 microseconds whatever the
-/// range).
-const AHEAD_GAP: usize = (8 << 20) / PAGE;
+/// walking the pages between them (up to 32 MiB) costs less than another
+/// kernel call, which resets written pages and costs 30-70 microseconds.
+const AHEAD_GAP: usize = (32 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
@@ -231,7 +230,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             if ask_kernel(j, first, last) {
                 j.ahead.push((first, last));
             } else {
-                j.unwatched.insert(first, last);
+                j.unwatched.insert((first, last));
             }
         } else {
             ask_run(j, &pending[i..k]);
@@ -280,7 +279,7 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
         return;
     }
     if pieces.len() == 1 {
-        j.unwatched.insert(first, last);
+        j.unwatched.insert((first, last));
         return;
     }
     let (a, b) = pieces.split_at(pieces.len() / 2);
@@ -418,7 +417,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             slow(started.elapsed().as_micros() as u64);
         }
         if failed {
-            j.unwatched.insert(first, last);
+            j.unwatched.insert((first, last));
         }
         failed
     };
