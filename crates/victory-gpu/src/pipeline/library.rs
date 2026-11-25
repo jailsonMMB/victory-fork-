@@ -437,8 +437,17 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
-/// Title pipelines listed for an early start, at most.
-const EARLY_MAX: usize = 8192;
+/// Maximum title keys retained for early starts; zero disables prewarming.
+fn early_max() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("VICTORY_EARLY_MAX")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(64)
+            .min(256)
+    })
+}
 
 fn library() -> Option<&'static Library> {
     // VKD3D may reject CreatePipelineLibrary even though ordinary PSO
@@ -622,7 +631,9 @@ pub(crate) fn save(now: bool) {
         }
         0
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    let mut used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    used.sort_unstable();
+    used.truncate(early_max());
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         let in_place = !dir.join(NEXT_FILE).exists();
@@ -707,8 +718,16 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
             .get()
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
-        let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
-        tracing::info!(pipelines = set.len(), "title pipelines to start early");
+        let limit = early_max();
+        let mut keys: Vec<String> = listed.lines().filter(|line| !line.is_empty()).map(str::to_owned).collect();
+        keys.sort_unstable();
+        let total = keys.len();
+        keys.truncate(limit);
+        if total > limit {
+            USED_CHANGED.store(true, Ordering::Relaxed);
+        }
+        let set: HashSet<String> = keys.into_iter().collect();
+        tracing::info!(pipelines = set.len(), limit, "title pipelines to start early");
         *used = Some(set);
     }
     used
@@ -723,7 +742,7 @@ pub(crate) fn wanted_early(key: &str) -> bool {
 pub(crate) fn note_used(key: &str) {
     let mut used = used();
     let set = used.get_or_insert_with(HashSet::new);
-    if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
+    if set.len() < early_max() && set.insert(key.to_owned()) {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }
