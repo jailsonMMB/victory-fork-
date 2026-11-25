@@ -5732,15 +5732,143 @@ impl Batch {
     }
 }
 
+/// Whether a bulk read of title memory copies it directly (`memcpy`) when
+/// its pages are there, instead of asking the kernel. On by default;
+/// `VICTORY_DIRECT_READ=0` keeps the kernel's `ReadProcessMemory` for
+/// every read, as before.
+fn direct_reads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_READ").is_none_or(|v| v != "0"))
+}
+
+/// Bytes [`direct_read`] copied since the last frame line, and the reads it
+/// left to the kernel because a page was not there.
+pub(crate) static DIRECT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DIRECT_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// Set while this thread holds title memory's read side for a direct
+    /// copy.
+    static READING_NOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Title memory's read side for a direct copy, taken once a thread: the
+/// inner `Option` is `None` on a thread that already had it, so that the
+/// `RwLock` is not taken twice ([`crate::watch::title_memory_reading_now`]).
+struct Reading(Option<crate::watch::Reading>);
+
+impl Reading {
+    fn take() -> Option<Reading> {
+        let already = READING_NOW.with(|r| r.replace(true));
+        if already {
+            return Some(Reading(None));
+        }
+        match crate::watch::title_memory_reading_now() {
+            Some(r) => Some(Reading(Some(r))),
+            None => {
+                READING_NOW.with(|r| r.set(false));
+                None
+            }
+        }
+    }
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        if let Some(r) = self.0.take() {
+            drop(r);
+            READING_NOW.with(|now| now.set(false));
+        }
+    }
+}
+
+/// Reads title memory at `src` into `dst` (`len` bytes) by copying it
+/// directly, as `memcpy` would, when every page of it is there; false
+/// otherwise (the caller takes the kernel's way).
+///
+/// The memory is this process's own (the runtime's `XMemVirtualAlloc`
+/// sections), so the kernel's copy moves nothing a copy could not: it is
+/// paying the syscall, and under Wine the syscall is the wineserver. The
+/// frame line's "copies" was 201.6 MB in 3627 ms a frame, 55 MB/s, where a
+/// `memcpy` of the same pages runs at 10-20 GB/s.
+///
+/// What makes it safe is asking the pages first, in batches of 256, as
+/// `crate::texture::readable` does: a page not in the working set is not
+/// touched and the whole read goes the kernel's way, which is also what
+/// happens to a page the title gives up between the question and the copy
+/// (the answer can be stale, and a stale "there" faults: so the pages are
+/// asked, and the copy still goes the kernel's way if the title is in the
+/// middle of a remap, [`crate::watch::title_memory_reading_now`]).
+fn direct_read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const PAGE: usize = 4096;
+    if len == 0 {
+        return true;
+    }
+    // A read of title memory in place must not cross a remap; the kernel's
+    // way is the fallback while one is under way.
+    //
+    // A caller may already hold the read side (`crate::texture`'s refresh
+    // reads title memory in place and takes it; that read does not go
+    // through here today, but a later one might). `std::sync::RwLock` may
+    // not be taken twice by one thread — it can deadlock — so a thread's
+    // first taking is noted and a second is not taken.
+    let Some(_reading) = Reading::take() else {
+        return false;
+    };
+    // (a source that starts inside a page is asked for from that page's
+    // start: the pages the read touches, and no others)
+    let first = src as usize / PAGE;
+    let pages = ((src as usize % PAGE).saturating_add(len)).div_ceil(PAGE);
+    // SAFETY: plain data.
+    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+    let mut done = 0;
+    while done < pages {
+        let n = (pages - done).min(info.len());
+        for (i, entry) in info[..n].iter_mut().enumerate() {
+            entry.VirtualAddress = ((first + done + i) * PAGE) as *mut _;
+        }
+        // SAFETY: `n` entries of the size given; our own process.
+        let asked = unsafe {
+            K32QueryWorkingSetEx(
+                GetCurrentProcess(),
+                info.as_mut_ptr().cast(),
+                (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+            )
+        } != 0;
+        if !asked {
+            return false;
+        }
+        for entry in info[..n].iter() {
+            // Bit 0 of the answer: the page is in the working set.
+            // SAFETY: plain data the query filled in.
+            if unsafe { entry.VirtualAttributes.Flags } & 1 == 0 {
+                return false;
+            }
+        }
+        done += n;
+    }
+    // SAFETY: every page of the source was found present; the destination
+    // is the caller's mapped host memory, and the ranges do not overlap.
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+    DIRECT_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+    true
+}
+
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
 /// destination (`title_dst`) that is not all mapped is left alone.
 ///
 /// The source is read through the kernel (`ReadProcessMemory`), which
-/// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
-/// cost about 2 ms per copy in the title's big pools (it walks the page
-/// tables to the region's end), which made copies run at 100-200 MB/s.
+/// reports an unmapped page instead of faulting; a whole read of title
+/// memory whose pages are all there is copied directly instead
+/// ([`direct_read`]). Asking `VirtualQuery` first cost about 2 ms per copy
+/// in the title's big pools (it walks the page tables to the region's end),
+/// which made copies run at 100-200 MB/s; asking the pages instead costs a
+/// page-table walk too, but 256 pages at a time and only for the pages the
+/// copy holds.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -5774,7 +5902,16 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let whole = if !title_dst && direct_reads() {
+        if direct_read(src, dst, len) {
+            true
+        } else {
+            DIRECT_REFUSED.fetch_add(1, Ordering::Relaxed);
+            read(src, dst, len)
+        }
+    } else {
+        read(src, dst, len)
+    };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -6109,6 +6246,18 @@ impl Meter {
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
         });
+        // How much of the "copies" went the direct way (`memcpy`) instead
+        // of the kernel's `ReadProcessMemory`.
+        {
+            let bytes = DIRECT_BYTES.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
+            let refused = DIRECT_REFUSED.swap(0, Ordering::Relaxed) as f64 / frames;
+            if bytes > 0.0 || refused > 0.0 {
+                tracing::info!(
+                    "  copies by the direct read: {bytes:.1} MB a frame copied as `memcpy` (VICTORY_DIRECT_READ=0 \
+                     keeps the kernel's way), {refused:.0} reads a frame left to the kernel (a page was not there)"
+                );
+            }
+        }
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
