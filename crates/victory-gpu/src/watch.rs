@@ -65,14 +65,16 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
 /// both ahead asks and per-range fallback asks (release telemetry).
 static AHEAD_ASKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AHEAD_ASK_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AHEAD_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static WRITES_ASKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static WRITES_ASK_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-pub(crate) fn take_kernel_stats() -> (u64, u64, u64, u64) {
+pub(crate) fn take_kernel_stats() -> (u64, u64, u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (
         AHEAD_ASKS.swap(0, Relaxed),
         AHEAD_ASK_US.swap(0, Relaxed),
+        AHEAD_REFUSED.swap(0, Relaxed),
         WRITES_ASKS.swap(0, Relaxed),
         WRITES_ASK_US.swap(0, Relaxed),
     )
@@ -316,6 +318,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         std::sync::atomic::Ordering::Relaxed,
     );
     if failed {
+        AHEAD_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return false;
     }
     #[cfg(feature = "diagnostics")]
