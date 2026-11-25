@@ -6407,11 +6407,13 @@ impl Meter {
                 breakdown[10] / 1e3, breakdown[11]
             );
         }
-        let (ahead_asks, ahead_us, writes_asks, writes_us) = crate::watch::take_kernel_stats();
+        let (ahead_asks, ahead_us, ahead_refused, writes_asks, writes_us) =
+            crate::watch::take_kernel_stats();
         tracing::info!(
-            "GetWriteWatch per frame: ask_ahead {:.1} calls / {:.1} ms, writes fallback {:.1} calls / {:.1} ms",
+            "GetWriteWatch per frame: ask_ahead {:.1} calls / {:.1} ms ({:.1} refused), writes fallback {:.1} calls / {:.1} ms",
             ahead_asks as f64 / frames,
             ahead_us as f64 / 1e3 / frames,
+            ahead_refused as f64 / frames,
             writes_asks as f64 / frames,
             writes_us as f64 / 1e3 / frames
         );
