@@ -454,6 +454,17 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Release-build breakdown of `preparing: copies`, as (microseconds, calls)
+/// pairs: Batch update, Shadow update_free, write-watch, copy_stale, staging,
+/// and batch flush. Times are inclusive where a parent contains a child.
+pub(crate) static COPY_BREAKDOWN: [std::sync::atomic::AtomicU64; 12] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+
+pub(crate) fn copy_breakdown(slot: usize, elapsed: std::time::Duration) {
+    COPY_BREAKDOWN[slot * 2].fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+    COPY_BREAKDOWN[slot * 2 + 1].fetch_add(1, Ordering::Relaxed);
+}
+
 /// Host buffers made since the start, as (count, bytes): in the upload heap
 /// (staging, list scratch), shared with the processor (host copies of title
 /// memory) and the graphics card's own (indirect arguments, twins' copies).
@@ -5527,9 +5538,11 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging) => {
+                    let staging_started = std::time::Instant::now();
                     if batch.texture_due(staging) {
                         staging.refresh();
                     }
+                    crate::host::copy_breakdown(4, staging_started.elapsed());
                     continue;
                 }
             };
@@ -5604,13 +5617,16 @@ impl Batch {
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
+        let flush_started = std::time::Instant::now();
         Self::update(&shadow, from, to);
+        crate::host::copy_breakdown(5, flush_started.elapsed());
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
         let started = std::time::Instant::now();
         let copied = shadow.update(from, to - from);
+        crate::host::copy_breakdown(0, started.elapsed());
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
@@ -5697,6 +5713,7 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        let flush_started = std::time::Instant::now();
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -5734,6 +5751,7 @@ impl Batch {
         if ahead {
             crate::watch::ask_ahead_done();
         }
+        crate::host::copy_breakdown(5, flush_started.elapsed());
     }
 }
 
@@ -6375,6 +6393,30 @@ impl Meter {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
         });
+        let breakdown: [f64; 12] = std::array::from_fn(|i| {
+            COPY_BREAKDOWN[i].swap(0, Ordering::Relaxed) as f64 / frames
+        });
+        if breakdown.iter().any(|&value| value > 0.0) {
+            tracing::info!(
+                "preparing: copies breakdown per frame (ms / calls): Batch::update {:.1} / {:.0}, Shadow::update_free {:.1} / {:.0}, watch::writes {:.1} / {:.0}, copy_stale {:.1} / {:.0}, staging {:.1} / {:.0}, flush {:.1} / {:.0}; nested times overlap",
+                breakdown[0] / 1e3, breakdown[1],
+                breakdown[2] / 1e3, breakdown[3],
+                breakdown[4] / 1e3, breakdown[5],
+                breakdown[6] / 1e3, breakdown[7],
+                breakdown[8] / 1e3, breakdown[9],
+                breakdown[10] / 1e3, breakdown[11]
+            );
+        }
+        let (ahead_asks, ahead_us, ahead_refused, writes_asks, writes_us) =
+            crate::watch::take_kernel_stats();
+        tracing::info!(
+            "GetWriteWatch per frame: ask_ahead {:.1} calls / {:.1} ms ({:.1} refused), writes fallback {:.1} calls / {:.1} ms",
+            ahead_asks as f64 / frames,
+            ahead_us as f64 / 1e3 / frames,
+            ahead_refused as f64 / frames,
+            writes_asks as f64 / frames,
+            writes_us as f64 / 1e3 / frames
+        );
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });

@@ -2568,16 +2568,23 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        let free_started = std::time::Instant::now();
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            let watch_started = std::time::Instant::now();
+            let result = crate::watch::writes(from, to, true);
+            crate::host::copy_breakdown(2, watch_started.elapsed());
+            if let Some((now, written)) = result {
                 self.watched.store(1, Ordering::Relaxed);
+                let stale_started = std::time::Instant::now();
                 let copied = self.copy_stale(from, to, now, &written);
+                crate::host::copy_breakdown(3, stale_started.elapsed());
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
                     add(C::Checked, (to - from) as u64);
                     add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
                 }
+                crate::host::copy_breakdown(1, free_started.elapsed());
                 return copied;
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
@@ -2589,6 +2596,7 @@ impl Shadow {
         self.copy(from, to);
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
+        crate::host::copy_breakdown(1, free_started.elapsed());
         to - from
     }
 

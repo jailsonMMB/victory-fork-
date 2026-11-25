@@ -15,9 +15,9 @@
 //! The default budget is half a second per title frame. A pass the title
 //! runs only once and whose pipeline takes longer is lost.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Shader;
@@ -28,11 +28,12 @@ pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queue_state: AtomicU8,
-    made: OnceLock<Option<HostPipeline>>,
+    made: OnceLock<Option<Arc<HostPipeline>>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    prewarm: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -40,6 +41,39 @@ pub(crate) struct Pending {
 unsafe impl Send for Pending {}
 // SAFETY: as above.
 unsafe impl Sync for Pending {}
+
+/// An early or requested host pipeline can serve another title pipeline with
+/// the same cross-run key. D3D12 objects are free-threaded; the wrapper lets
+/// the cache share them through its mutex.
+struct CachedHost(Arc<HostPipeline>);
+
+// SAFETY: `HostPipeline` contains free-threaded D3D12 objects and immutable metadata.
+unsafe impl Send for CachedHost {}
+
+static HOST_CACHE: OnceLock<Mutex<HashMap<String, CachedHost>>> = OnceLock::new();
+
+fn cache_lock(key: &str) -> MutexGuard<'static, ()> {
+    static LOCKS: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
+    let at = key.bytes().fold(0usize, |hash, byte| hash.wrapping_mul(31).wrapping_add(usize::from(byte)));
+    LOCKS[at % LOCKS.len()].lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn cached(key: &str) -> Option<Arc<HostPipeline>> {
+    HOST_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .map(|pipeline| pipeline.0.clone())
+}
+
+fn remember(key: &str, pipeline: Arc<HostPipeline>) {
+    HOST_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key.to_owned(), CachedHost(pipeline));
+}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
@@ -56,12 +90,30 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            prewarm: AtomicBool::new(false),
         }
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        let cache_enabled = pso_cache_enabled();
+        let _same = cache_enabled.then(|| cache_lock(&self.key));
+        self.made.get_or_init(|| {
+            if cache_enabled && let Some(pipeline) = cached(&self.key) {
+                super::library::MEMORY_HITS.fetch_add(1, Ordering::Relaxed);
+                return Some(pipeline);
+            }
+            super::library::MEMORY_MISSES.fetch_add(1, Ordering::Relaxed);
+            let pipeline = HostPipeline::new(&self.shaders, self.graphics.as_deref()).map(Arc::new)?;
+            if cache_enabled {
+                remember(&self.key, pipeline.clone());
+            }
+            Some(pipeline)
+        });
+        if self.prewarm.swap(false, Ordering::Relaxed)
+            && self.made.get().is_some_and(|pipeline| pipeline.is_some())
+        {
+            super::library::WARMED.fetch_add(1, Ordering::Relaxed);
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -118,6 +170,7 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    queue_line();
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -127,7 +180,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
-    p.made.get()?.as_ref()
+    p.made.get()?.as_ref().map(Arc::as_ref)
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -140,7 +193,7 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) && workers() {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }
@@ -221,6 +274,7 @@ const MAKING: u8 = 3;
 struct Queue {
     early: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
+    early_active: usize,
 }
 
 impl Queue {
@@ -228,6 +282,7 @@ impl Queue {
         Self {
             early: VecDeque::new(),
             requested: VecDeque::new(),
+            early_active: 0,
         }
     }
 
@@ -247,19 +302,67 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
-    fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
-            // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
-        p.queue_state.store(MAKING, Ordering::Relaxed);
-        Some(p)
+    fn pop(&mut self, early_limit: usize) -> Option<(Arc<Pending>, bool)> {
+        if let Some(pipeline) = self.requested.pop_front() {
+            pipeline.queue_state.store(MAKING, Ordering::Relaxed);
+            return Some((pipeline, false));
+        }
+        if self.early_active >= early_limit {
+            return None;
+        }
+        // An early entry can have been promoted and claimed already.
+        let pipeline = std::iter::from_fn(|| self.early.pop_front())
+            .find(|pipeline| pipeline.queue_state.load(Ordering::Relaxed) == EARLY)?;
+        pipeline.queue_state.store(MAKING, Ordering::Relaxed);
+        self.early_active += 1;
+        Some((pipeline, true))
     }
 }
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 static AVAILABLE: Condvar = Condvar::new();
+
+fn early_workers() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_EARLY_WORKERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(2)
+            .clamp(1, 4)
+    })
+}
+
+fn pso_cache_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("VICTORY_PSO_CACHE").ok().is_none_or(|value| value != "0"))
+}
+
+fn queue_line() {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let mut last = LAST.load(Ordering::Relaxed);
+    loop {
+        if now.saturating_sub(last) < 5_000 {
+            return;
+        }
+        match LAST.compare_exchange_weak(last, now, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => last = actual,
+        }
+    }
+    let queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    tracing::info!(
+        queue_depth = queue.early.len() + queue.requested.len() + queue.early_active,
+        outstanding = WAITING.load(Ordering::Relaxed),
+        requested = queue.requested.len(),
+        early = queue.early.len(),
+        early_in_flight = queue.early_active,
+        early_workers = early_workers(),
+        pso_cache = pso_cache_enabled(),
+        "host pipeline worker queue"
+    );
+}
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
@@ -269,12 +372,18 @@ fn start(p: &Arc<Pending>, priority: u8) {
     }
     if !workers() {
         if p.queue_state.swap(MAKING, Ordering::Relaxed) == NOT_QUEUED {
+            if priority == EARLY {
+                p.prewarm.store(true, Ordering::Relaxed);
+            }
             p.make();
         }
         return;
     }
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
+        if priority == EARLY {
+            p.prewarm.store(true, Ordering::Relaxed);
+        }
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
@@ -282,11 +391,11 @@ fn start(p: &Arc<Pending>, priority: u8) {
     }
 }
 
-fn next() -> Arc<Pending> {
+fn next() -> (Arc<Pending>, bool) {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop() {
-            return p;
+        if let Some(pipeline) = queue.pop(early_workers()) {
+            return pipeline;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
     }
@@ -297,7 +406,8 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let normal = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = normal.max(early_workers() + 1).min(8);
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
@@ -309,7 +419,13 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        next().make();
+                        let (pipeline, early) = next();
+                        pipeline.make();
+                        if early {
+                            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                            queue.early_active = queue.early_active.saturating_sub(1);
+                            AVAILABLE.notify_all();
+                        }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -333,12 +449,15 @@ static PEAK: AtomicU64 = AtomicU64::new(0);
 /// The workers ran out of work: logged after a batch of 10 or more, and
 /// the cache saved (at most every 20 s).
 fn drained() {
-    use super::library::{EARLY, LOADED, MADE};
+    use super::library::{EARLY, LOADED, MADE, MEMORY_HITS, MEMORY_MISSES, WARMED};
     if PEAK.swap(0, Ordering::Relaxed) >= 10 {
         tracing::info!(
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
+            memory_hits = MEMORY_HITS.load(Ordering::Relaxed),
+            memory_misses = MEMORY_MISSES.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            warmed = WARMED.load(Ordering::Relaxed),
             "host pipelines all made"
         );
     }
@@ -390,10 +509,18 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
 
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
+        let (pipeline, early) = queue.pop(2).unwrap();
+        assert!(Arc::ptr_eq(&pipeline, &requested));
+        assert!(!early);
+        let (pipeline, early) = queue.pop(2).unwrap();
+        assert!(Arc::ptr_eq(&pipeline, &promoted));
+        assert!(!early);
         assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
-        assert!(queue.pop().is_none());
+        let (pipeline, early) = queue.pop(2).unwrap();
+        assert!(Arc::ptr_eq(&pipeline, &earlier));
+        assert!(early);
+        assert!(queue.pop(1).is_none());
+        queue.early_active -= 1;
+        assert!(queue.pop(1).is_none());
     }
 }
