@@ -35,6 +35,9 @@ struct Journal {
     asked: u64,
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
+    /// Ranges which GetWriteWatch has refused: retrying the syscall for
+    /// these ranges cannot help until the runtime remaps them.
+    unwatched: BTreeSet<(usize, usize)>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
@@ -51,6 +54,7 @@ struct Journal {
 static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
+    unwatched: BTreeSet::new(),
     found: Vec::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
@@ -59,14 +63,18 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
 
 /// Actual GetWriteWatch kernel calls and their elapsed microseconds, including
 /// both ahead asks and per-range fallback asks (release telemetry).
-static KERNEL_ASKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static KERNEL_ASK_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AHEAD_ASKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AHEAD_ASK_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WRITES_ASKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WRITES_ASK_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-pub(crate) fn take_kernel_stats() -> (u64, u64) {
+pub(crate) fn take_kernel_stats() -> (u64, u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (
-        KERNEL_ASKS.swap(0, Relaxed),
-        KERNEL_ASK_US.swap(0, Relaxed),
+        AHEAD_ASKS.swap(0, Relaxed),
+        AHEAD_ASK_US.swap(0, Relaxed),
+        WRITES_ASKS.swap(0, Relaxed),
+        WRITES_ASK_US.swap(0, Relaxed),
     )
 }
 
@@ -201,7 +209,10 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         .iter()
         .filter(|&&(start, end)| start < end)
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
-        .filter(|&(first, last)| !j.ahead.iter().any(|&(a, b)| a <= first && last <= b))
+        .filter(|&(first, last)| {
+            !j.ahead.iter().any(|&(a, b)| a <= first && last <= b)
+                && !j.unwatched.contains(&(first, last))
+        })
         .collect();
     pending.sort_unstable();
     let mut i = 0;
@@ -219,6 +230,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         if k - i == 1 {
             if ask_kernel(j, first, last) {
                 j.ahead.push((first, last));
+            } else {
+                j.unwatched.insert(first, last);
             }
         } else {
             ask_run(j, &pending[i..k]);
@@ -255,15 +268,19 @@ pub(crate) fn wrote(at: usize, len: usize) {
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
-/// write-watched does. A piece alone is left to [`writes`].
+/// write-watched does. Refused single ranges are cached until remapping.
 fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
-    if pieces.len() < 2 {
+    if pieces.is_empty() {
         return;
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
     if ask_kernel(j, first, last) {
         j.ahead.push((first, last));
+        return;
+    }
+    if pieces.len() == 1 {
+        j.unwatched.insert(first, last);
         return;
     }
     let (a, b) = pieces.split_at(pieces.len() / 2);
@@ -294,8 +311,11 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
             &mut granularity,
         )
     } != 0;
-    KERNEL_ASKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    KERNEL_ASK_US.fetch_add(kernel_started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    AHEAD_ASKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    AHEAD_ASK_US.fetch_add(
+        kernel_started.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     if failed {
         return false;
     }
@@ -364,25 +384,44 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 .collect(),
         ));
     }
+    let known_unwatched = j.unwatched.contains(&(first, last));
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
-    let kernel_started = std::time::Instant::now();
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    KERNEL_ASKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    KERNEL_ASK_US.fetch_add(kernel_started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    let failed = if known_unwatched {
+        true
+    } else {
+        j.found.resize(count.max(j.found.len()), 0);
+        let kernel_started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        // SAFETY: the answer buffer holds `count` entries.
+        let failed = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+        WRITES_ASKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        WRITES_ASK_US.fetch_add(
+            kernel_started.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Watches, 1);
+            add(C::WatchUs, started.elapsed().as_micros() as u64);
+            slow(started.elapsed().as_micros() as u64);
+        }
+        if failed {
+            j.unwatched.insert(first, last);
+        }
+        failed
+    };
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -397,13 +436,6 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     } else {
         Vec::new()
     };
-    #[cfg(feature = "diagnostics")]
-    {
-        use crate::copystat::{C, add};
-        add(C::Watches, 1);
-        add(C::WatchUs, started.elapsed().as_micros() as u64);
-        slow(started.elapsed().as_micros() as u64);
-    }
     j.asked += 1;
     let now = j.asked;
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
@@ -697,6 +729,20 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+    {
+        let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+        let first = at / PAGE;
+        let last = at.saturating_add(len).div_ceil(PAGE);
+        let stale: Vec<(usize, usize)> = j
+            .unwatched
+            .iter()
+            .copied()
+            .filter(|&(start, end)| start < last && end > first)
+            .collect();
+        for range in stale {
+            j.unwatched.remove(&range);
+        }
+    }
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
