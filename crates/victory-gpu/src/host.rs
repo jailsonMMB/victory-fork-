@@ -5745,6 +5745,9 @@ fn direct_reads() -> bool {
 /// left to the kernel because a page was not there.
 pub(crate) static DIRECT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DIRECT_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Bytes [`write_mapped`] wrote directly into title memory since the last
+/// frame line.
+pub(crate) static DIRECT_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 thread_local! {
     /// Set while this thread holds title memory's read side for a direct
@@ -6035,6 +6038,21 @@ fn direct_writes() -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // The same way round as `direct_read`: the destination is this
+    // process's own title memory, and a write whose pages are all there
+    // needs no syscall. `crate::watch::writing` (the caller's) has opened
+    // the guarded blocks already, so what is asked here is only whether
+    // the pages are committed and readable: a page that is not there is
+    // written page by page through the kernel below, as before.
+    // (the asking is a page-table walk itself: only worth it for a run
+    // many pages long, which is what a copy-back run is)
+    if direct_reads() && len >= 64 << 10 && crate::texture::committed(dst, len) {
+        // SAFETY: every page of the destination was found committed and
+        // readable, and the source is the caller's host memory.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+        DIRECT_WRITES.fetch_add(len as u64, Ordering::Relaxed);
+        return;
+    }
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
@@ -6246,15 +6264,18 @@ impl Meter {
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
         });
-        // How much of the "copies" went the direct way (`memcpy`) instead
-        // of the kernel's `ReadProcessMemory`.
+        // How much of the "copies" and of the putting back went the direct
+        // way (`memcpy`) instead of the kernel's ReadProcessMemory and
+        // NtWriteVirtualMemory.
         {
-            let bytes = DIRECT_BYTES.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
+            let read = DIRECT_BYTES.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
+            let wrote = DIRECT_WRITES.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
             let refused = DIRECT_REFUSED.swap(0, Ordering::Relaxed) as f64 / frames;
-            if bytes > 0.0 || refused > 0.0 {
+            if read > 0.0 || wrote > 0.0 || refused > 0.0 {
                 tracing::info!(
-                    "  copies by the direct read: {bytes:.1} MB a frame copied as `memcpy` (VICTORY_DIRECT_READ=0 \
-                     keeps the kernel's way), {refused:.0} reads a frame left to the kernel (a page was not there)"
+                    "  copied without the kernel, per frame: {read:.1} MB read into host memory and {wrote:.1} MB \
+                     written into title memory as `memcpy` (VICTORY_DIRECT_READ=0 keeps the kernel's way); \
+                     {refused:.0} reads a frame left to the kernel (a page was not there)"
                 );
             }
         }
