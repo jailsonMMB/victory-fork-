@@ -3499,8 +3499,10 @@ impl Host {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
         };
-        let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
-        let mut total = 0u64;
+        // ([`Host::card_back`]'s joins happen before the offsets in the
+        // fetched buffer are given, for the same reason: a join grows a
+        // span, and what lies behind it in the buffer moves.)
+        let mut found: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         if let Some((differs, dwords)) = differs {
             // SAFETY: the mapping of the results. The compares of these
             // plans have run, and their dwords are given to no other plan
@@ -3527,12 +3529,41 @@ impl Host {
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo < hi && seen.insert((copy, lo, hi)) {
-                            pieces.push((r.shadow.clone(), lo, hi, total));
-                            total += (hi - lo) as u64;
+                            found.push((r.shadow.clone(), lo, hi));
                         }
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                 }
+            }
+        }
+        // A run costs a kernel read and a write whatever its size
+        // (`Shadow::card_merge_relay`), so pieces that touch are one run,
+        // and with `VICTORY_COPYBACK_SMALL=1` those within 4 KiB as well.
+        //
+        // The order the pieces came in is kept, and a span only joins the
+        // one just before it: flights land in the order of [`LINE`] so that
+        // a later flight's results never reach title memory before an
+        // earlier flight's, and sorting the spans would lose that. A span
+        // that starts before the one before it (ranges of one plan are in
+        // the order the title declared them, not by address) is no join.
+        let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
+        let mut total = 0u64;
+        {
+            let close = if crate::shadow::merge_small_runs() { SMALL_GAP } else { 0 };
+            let mut joined: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::with_capacity(found.len());
+            for (shadow, lo, hi) in found {
+                match joined.last_mut() {
+                    Some(last)
+                        if std::sync::Arc::ptr_eq(&last.0, &shadow) && lo >= last.2 && last.2 + close >= lo =>
+                    {
+                        last.2 = last.2.max(hi);
+                    }
+                    _ => joined.push((shadow, lo, hi)),
+                }
+            }
+            for (shadow, lo, hi) in joined {
+                pieces.push((shadow, lo, hi, total));
+                total += (hi - lo) as u64;
             }
         }
         if pieces.is_empty() {

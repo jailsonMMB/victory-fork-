@@ -2796,6 +2796,7 @@ impl Shadow {
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
+        CARD_STATS[card_stat::RUNS].fetch_add(1, Ordering::Relaxed);
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
@@ -2808,7 +2809,11 @@ impl Shadow {
         };
         title.clear();
         title.resize(n, 0);
+        let reading = std::time::Instant::now();
         let mapped = crate::host::read_into((start + at) as *const u8, title);
+        CARD_STATS[card_stat::READS].fetch_add(1, Ordering::Relaxed);
+        CARD_STATS[card_stat::READ_US].fetch_add(reading.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let merging = std::time::Instant::now();
         let mut changed = false;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
@@ -2816,11 +2821,15 @@ impl Shadow {
             // the card wrote, as before; `title` is scratch then.
             changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
         }
+        CARD_STATS[card_stat::MERGE_US].fetch_add(merging.elapsed().as_micros() as u64, Ordering::Relaxed);
         if !mapped || !changed {
             return 0;
         }
+        let writing = std::time::Instant::now();
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        CARD_STATS[card_stat::WRITE_US].fetch_add(writing.elapsed().as_micros() as u64, Ordering::Relaxed);
+        CARD_STATS[card_stat::WRITES].fetch_add(1, Ordering::Relaxed);
         n
     }
 }
