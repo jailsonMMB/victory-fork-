@@ -961,7 +961,7 @@ pub(crate) fn wide_back() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_some_and(|v| v == "1"))
 }
 
-type Job = Box<dyn FnOnce() + Send>;
+pub(crate) type Job = Box<dyn FnOnce() + Send>;
 
 /// Threads kept for [`wide`]: what they are to do, and the word that there
 /// is something.
@@ -978,7 +978,11 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        // All but one core (was /4, 2-6): copies, refreshes and copy-back
+        // merges are kernel-bound and parallelise well; 12 threads on a
+        // 6C/12T CPU idle the card at 1-9% while the submitting thread
+        // does seconds of serial syscalls.
+        let n = std::thread::available_parallelism().map_or(4, |n| n.get()).saturating_sub(1).clamp(2, 12);
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -1879,6 +1883,73 @@ impl Shadow {
         self.copy_back_with(address, len, None)
     }
 
+    /// [`Shadow::copy_back_with`]'s last step (what the card wrote at
+    /// offsets `[at, at + n)` of the copy, a run of pieces the snapshot
+    /// does not hold, put into title memory): reads title memory there,
+    /// merges the card's bytes into it, writes it back, and takes the result
+    /// into the copy. Returns the bytes written. Only the range's bytes are
+    /// touched, so several runs of one copy may go on several threads at
+    /// once (each its own bytes); the snapshot's lock is not taken: the
+    /// caller holds it, and the runs' bytes lie in a range declared and not
+    /// done with, which no other writer touches.
+    pub(crate) fn copy_back_run(&self, at: usize, n: usize) -> usize {
+        if self.place.is_some() || n == 0 {
+            return 0;
+        }
+        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(before) = snapshot.as_ref() else {
+            return 0;
+        };
+        self.copy_back_run_with(at, n, before.as_ptr())
+    }
+
+    /// [`Shadow::copy_back_run`], the snapshot's bytes given: `before`, its
+    /// mapping, of a copy whose snapshot the caller holds. Returns the bytes
+    /// written to title memory.
+    fn copy_back_run_with(&self, at: usize, n: usize, before: *const u8) -> usize {
+        if self.place.is_some() || n == 0 {
+            return 0;
+        }
+        let start = self.start as usize;
+        // SAFETY: inside the mapping; only the submitting thread writes it.
+        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+        // SAFETY: the snapshot's allocation holds the copy's bytes at the
+        // copy's offsets (`writing`), and `at`/`n` lie in a declared range.
+        let old = unsafe { std::slice::from_raw_parts(before.add(at), n) };
+        // From the first byte that differs to the last: title memory is
+        // read and written there only (a shader that sets a few words of a
+        // piece cost a read, a walk and a write of all 64 KiB of it).
+        let Some(first) = first_difference(host, old) else {
+            return 0;
+        };
+        let last = last_difference(host, old).unwrap_or(first);
+        let (at, n) = (at + first, last + 1 - first);
+        let (host, old) = (&mut host[first..=last], &old[first..=last]);
+        let mut title = vec![0u8; n];
+        if !crate::host::read_into((start + at) as *const u8, &mut title) {
+            return 0;
+        }
+        // Title memory with the GPU's bytes put in; the copy takes the
+        // title's bytes in turn. Without a branch, so the loop runs many
+        // bytes at a time: the GPU's byte where the copy's byte is not what
+        // it was before the submission, else the title's. (With the two
+        // searches above this was 44 ms a frame for 970 pieces.)
+        let mut differs = 0u8;
+        for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+            let gpu = if *h != *o { 0xffu8 } else { 0 };
+            let merged = (*t & !gpu) | (*h & gpu);
+            differs |= merged ^ *t;
+            *t = merged;
+            *h = merged;
+        }
+        if differs == 0 {
+            return 0;
+        }
+        crate::watch::writing(start + at, n);
+        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        n
+    }
+
     /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
@@ -1888,14 +1959,14 @@ impl Shadow {
         let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
-        let start = self.start as usize;
         self.compared(from, to);
         if let Some(before) = &*snapshot
             && from < to
         {
             // SAFETY: `writing` set the snapshot's bytes of every declared
             // range, at the copy's offsets.
-            let before = unsafe { std::slice::from_raw_parts(before.as_ptr().add(from), to - from) };
+            let before_ptr = before.as_ptr();
+            let before = unsafe { std::slice::from_raw_parts(before_ptr.add(from), to - from) };
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission (on several threads: gigabytes a frame, bound by
             // memory speed), title memory read only where the GPU wrote.
@@ -1930,48 +2001,10 @@ impl Shadow {
             for &(at, n) in &differing {
                 self.changed(at, at + n);
             }
-            let mut title = vec![0u8; PIECE];
+            // (`before` is the snapshot's mapping, held here: the runs read
+            // it, none of them takes the lock again.)
             for (at, n) in differing {
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
-                // From the first byte that differs to the last: title
-                // memory is read and written there only (a shader that sets
-                // a few words of a piece cost a read, a walk and a write of
-                // all 64 KiB of it).
-                let Some(first) = first_difference(host, old) else {
-                    continue;
-                };
-                let last = last_difference(host, old).unwrap_or(first);
-                let (at, n) = (at + first, last + 1 - first);
-                let (host, old) = (&mut host[first..=last], &old[first..=last]);
-                if title.len() < n {
-                    title.resize(n, 0);
-                }
-                let title = &mut title[..n];
-                if !crate::host::read_into((start + at) as *const u8, title) {
-                    continue;
-                }
-                // Title memory with the GPU's bytes put in; the copy takes
-                // the title's bytes in turn.
-                // Without a branch, so the loop runs many bytes at a time:
-                // the GPU's byte where the copy's byte is not what it was
-                // before the submission, else the title's. (With the two
-                // searches above this was 44 ms a frame for 970 pieces.)
-                let mut differs = 0u8;
-                for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                    let gpu = if *h != *o { 0xffu8 } else { 0 };
-                    let merged = (*t & !gpu) | (*h & gpu);
-                    differs |= merged ^ *t;
-                    *t = merged;
-                    *h = merged;
-                }
-                if differs != 0 {
-                    crate::watch::writing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                    written += n;
-                }
+                written += self.copy_back_run_with(at, n, before_ptr);
             }
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a

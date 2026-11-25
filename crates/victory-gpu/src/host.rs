@@ -1575,7 +1575,7 @@ static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atom
 /// so eight threads take an eighth of them each.
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_none_or(|v| v != "0"))
 }
 
 /// One declared range of a copy in the card's memory, in a submission.
@@ -2055,6 +2055,89 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     ranges.get(at).is_some_and(|r| r.0 < to)
 }
 
+/// Whether the merges of what shaders wrote go on several threads
+/// (`VICTORY_WIDE_HAND_BACK=0` keeps them on the thread that settles).
+///
+/// Each run is a kernel read of title memory, the merge, and a kernel
+/// write: some 2 ms a call whatever its size on Wine, and a heavy frame
+/// has 400 of them (runs 1.3-4.4 s on that one thread). A run touches its
+/// own bytes: its copy's mapping, its copy's snapshot (read under the
+/// lock, run by run), and its own bytes of title memory, which lie in a
+/// range declared and not done with.
+fn wide_hand_back() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_HAND_BACK").is_none_or(|v| v != "0"))
+}
+
+/// `runs` (a span of the work, the copy, its own data) in a few groups
+/// for [`crate::shadow::wide_run`], a copy whole in one group: a copy's
+/// runs share its snapshot's lock, so two threads taking them would wait
+/// on each other rather than on the kernel. The groups take turns, the
+/// biggest copies first, so that each gets a share of the kernel calls.
+fn runs_by_copy<T: Send + 'static>(
+    runs: Vec<(usize, std::sync::Arc<crate::shadow::Shadow>, T)>,
+    groups: usize,
+) -> Vec<Vec<(usize, std::sync::Arc<crate::shadow::Shadow>, T)>> {
+    let mut copies: Vec<(usize, Vec<(usize, std::sync::Arc<crate::shadow::Shadow>, T)>)> = Vec::new();
+    for (span, shadow, data) in runs {
+        let key = std::sync::Arc::as_ptr(&shadow) as usize;
+        match copies.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, group)) => group.push((span, shadow, data)),
+            None => copies.push((key, vec![(span, shadow, data)])),
+        }
+    }
+    // The copies with the most runs first: they are the ones worth spreading.
+    copies.sort_by_key(|(_, group)| std::cmp::Reverse(group.len()));
+    let groups = groups.clamp(1, copies.len().max(1));
+    let mut out: Vec<Vec<(usize, std::sync::Arc<crate::shadow::Shadow>, T)>> = (0..groups).map(|_| Vec::new()).collect();
+    let mut loads = vec![0usize; groups];
+    for (_, group) in copies {
+        let n = group.len();
+        // The least loaded group takes it.
+        let mut at = 0;
+        for (i, &load) in loads.iter().enumerate() {
+            if load < loads[at] {
+                at = i;
+            }
+        }
+        loads[at] += n;
+        out[at].extend(group);
+    }
+    out.retain(|g| !g.is_empty());
+    out
+}
+
+/// Runs [`crate::shadow::Shadow::copy_back_run`] for each of `runs` (which
+/// span of the work, the copy, offset, bytes), on several threads with
+/// [`wide_hand_back`]; returns the bytes written, per span.
+fn merge_runs(runs: Vec<(usize, std::sync::Arc<crate::shadow::Shadow>, usize, usize)>, spans: usize) -> Vec<usize> {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let written: std::sync::Arc<Vec<AtomicUsize>> = std::sync::Arc::new((0..spans).map(|_| AtomicUsize::new(0)).collect());
+    let runs_len = runs.len();
+    if !wide_hand_back() || runs.len() < 2 {
+        for (span, shadow, at, n) in runs {
+            written[span].fetch_add(shadow.copy_back_run(at, n), Relaxed);
+        }
+        return written.iter().map(|w| w.load(Relaxed)).collect();
+    }
+    // A few runs a job, runs of one copy apart where they can be: each run's
+    // kernel calls wait for the kernel, and a copy's runs share its
+    // snapshot's lock.
+    let jobs: Vec<crate::shadow::Job> = runs_by_copy(runs, runs_len.div_ceil(4).min(8))
+        .into_iter()
+        .map(|runs| {
+            let written = written.clone();
+            Box::new(move || {
+                for (span, shadow, at, n) in runs {
+                    written[span].fetch_add(shadow.copy_back_run(at, n), Relaxed);
+                }
+            }) as crate::shadow::Job
+        })
+        .collect();
+    crate::shadow::wide_run(jobs);
+    written.iter().map(|w| w.load(Relaxed)).collect()
+}
+
 /// `ranges` with `more`, in order, joined where they overlap or touch.
 fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
@@ -2483,25 +2566,53 @@ fn relay_hand_back(back: &[Declared]) {
     let found = crate::shadow::find_all(&work);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
-    let (mut now, mut title) = (Vec::new(), Vec::new());
-    for ((shadow, from, to), found) in work.iter().zip(found) {
-        let mut written = 0;
-        // Merge adjacent pieces: one kernel read/write per run, not per
-        // 64 KiB piece (see `Shadow::copy_back_with`).
-        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(found.len());
-        for (at, n) in found {
-            match merged.last_mut() {
-                Some(last) if last.0 + last.1 == at => last.1 += n,
-                _ => merged.push((at, n)),
+    // Merge adjacent pieces: one kernel read/write per run, not per 64 KiB
+    // piece (see `Shadow::copy_back_with`).
+    let merged: Vec<(usize, std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = work
+        .iter()
+        .enumerate()
+        .zip(found)
+        .flat_map(|((span, (shadow, _, _)), found)| {
+            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(found.len());
+            for (at, n) in found {
+                match merged.last_mut() {
+                    Some(last) if last.0 + last.1 == at => last.1 += n,
+                    _ => merged.push((at, n)),
+                }
             }
-        }
-        for (at, n) in merged {
-            written += shadow.relay_merge(at, n, &mut now, &mut title);
-        }
+            merged.into_iter().map(move |(at, n)| (span, shadow.clone(), at, n))
+        })
+        .collect();
+    // The merges (each a kernel read and maybe a kernel write) on several
+    // threads, a few runs to a job: a flight's landing thread stood seconds
+    // in them on heavy frames. Each run's bytes are its own (runs of a copy
+    // are disjoint, its own scratch vectors), and the snapshot's lock is
+    // taken run by run.
+    let written: std::sync::Arc<Vec<std::sync::atomic::AtomicUsize>> = std::sync::Arc::new(
+        (0..work.len())
+            .map(|_| std::sync::atomic::AtomicUsize::new(0))
+            .collect(),
+    );
+    let groups = if wide_hand_back() { merged.len().div_ceil(4).min(8) } else { 1 };
+    let jobs: Vec<crate::shadow::Job> = runs_by_copy(merged, groups)
+        .into_iter()
+        .map(|group| {
+            let written = written.clone();
+            Box::new(move || {
+                use std::sync::atomic::Ordering::Relaxed;
+                let (mut now, mut title) = (Vec::new(), Vec::new());
+                for (span, shadow, at, n) in group {
+                    written[span].fetch_add(shadow.relay_merge(at, n, &mut now, &mut title), Relaxed);
+                }
+            }) as crate::shadow::Job
+        })
+        .collect();
+    crate::shadow::wide_run(jobs);
+    for (span, (_, from, to)) in work.iter().enumerate() {
+        let written = written[span].load(Ordering::Relaxed);
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::compared(*from, to - from, written);
-        let _ = (from, to);
     }
 }
 
@@ -2652,7 +2763,7 @@ mod late_tests {
 /// only the copy that held it did.
 fn join_copies() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line: title buffer copies recorded, and those
@@ -2747,8 +2858,29 @@ fn hand_back(back: &[Declared]) {
         let found = crate::shadow::find_all(&work);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
-        for ((shadow, from, to), found) in work.iter().zip(found) {
-            let written = shadow.copy_back_with(*from, to - from, Some(found));
+        // The merges (a kernel read and a kernel write a run) on the
+        // worker threads: some 400 runs a heavy frame, each 2 ms of
+        // kernel time whatever its size, were 1.3-4.4 s on the one
+        // thread that settles. The runs of one copy touch its own bytes of
+        // title memory and of the copy, no two the same, and a copy's
+        // snapshot is only read (its lock is taken per run).
+        let runs: Vec<(usize, std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = work
+            .iter()
+            .enumerate()
+            .zip(found)
+            .flat_map(|((span, (shadow, _, _)), found)| {
+                let mut merged: Vec<(usize, usize)> = Vec::with_capacity(found.len());
+                for (at, n) in found {
+                    match merged.last_mut() {
+                        Some(last) if last.0 + last.1 == at => last.1 += n,
+                        _ => merged.push((at, n)),
+                    }
+                }
+                merged.into_iter().map(move |(at, n)| (span, shadow.clone(), at, n))
+            })
+            .collect();
+        let written = merge_runs(runs, work.len());
+        for ((_, from, to), written) in work.iter().zip(written) {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written);
@@ -3400,14 +3532,49 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        let mut title = Vec::new();
-        let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
-            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
-        }
+        // The merges into title memory on several threads (each piece its
+        // own bytes of the fetched mapping and of title memory): some 400
+        // pieces a heavy frame, a kernel read and maybe a write each.
+        let written = {
+            use std::sync::atomic::AtomicUsize;
+            let written = std::sync::Arc::new(AtomicUsize::new(0));
+            let each = pieces.len().div_ceil(8).max(4);
+            let jobs: Vec<crate::shadow::Job> = if wide_hand_back() && pieces.len() >= 2 {
+                pieces
+                    .chunks(each)
+                    .map(|chunk| {
+                        let chunk: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = chunk.to_vec();
+                        let written = written.clone();
+                        Box::new(move || {
+                            let mut title = Vec::new();
+                            let mut sum = 0;
+                            for (shadow, lo, hi, at) in chunk {
+                                // SAFETY: the mapping of the fetched bytes,
+                                // `total` of them; the copy into it has run.
+                                let gpu = unsafe { std::slice::from_raw_parts((data + at as usize) as *const u8, hi - lo) };
+                                sum += shadow.card_merge_relay(lo, gpu, after, &mut title);
+                            }
+                            written.fetch_add(sum, Ordering::Relaxed);
+                        }) as crate::shadow::Job
+                    })
+                    .collect()
+            } else {
+                let pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = pieces.clone();
+                let written = written.clone();
+                vec![Box::new(move || {
+                    let mut title = Vec::new();
+                    let mut sum = 0;
+                    for (shadow, lo, hi, at) in pieces {
+                        // SAFETY: as above.
+                        let gpu = unsafe { std::slice::from_raw_parts((data + at as usize) as *const u8, hi - lo) };
+                        sum += shadow.card_merge_relay(lo, gpu, after, &mut title);
+                    }
+                    written.fetch_add(sum, Ordering::Relaxed);
+                }) as crate::shadow::Job]
+            };
+            crate::shadow::wide_run(jobs);
+            written.load(Ordering::Relaxed)
+        };
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge.
         crate::shadow::relay_fetched(after);
@@ -5147,7 +5314,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
+                    batch.title_copy(dst, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -5308,6 +5475,71 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+    }
+
+    /// Before a title copy into `[dst, dst + len)`: the pending refreshes
+    /// done first. Only those whose title source that copy may overwrite:
+    /// a title copy is what the title writes with the CPU, and the copies
+    /// whose source it lies inside (the title's big GPU heap, its pools)
+    /// are the ones that must read the bytes before they change. The
+    /// others stay, and go at the next flush or before the lists run: the
+    /// world copy that flips every frame's records used to flush all some
+    /// sixty copies with it, some 70 times a submission, which is the
+    /// frame line's serial "copies" time.
+    fn title_copy(&mut self, dst: usize, len: usize) {
+        let (from, to) = (dst, dst.saturating_add(len));
+        // The refreshes whose title memory the copy writes: their ranges
+        // are title addresses.
+        let overlapping: Vec<usize> = self
+            .refreshes
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.1 < to && r.2 > from)
+            .map(|(i, _)| i)
+            .collect();
+        if overlapping.is_empty() {
+            self.textures.clear();
+            return;
+        }
+        self.textures.clear();
+        // One asking for the overlapping copies, then each done on its own.
+        let ranges: Vec<(usize, usize)> = overlapping
+            .iter()
+            .map(|&i| (self.refreshes[i].1, self.refreshes[i].2))
+            .filter(|r| r.0 < r.1)
+            .collect();
+        if ranges.len() > 1 {
+            crate::watch::ask_ahead(&ranges);
+        }
+        let mut jobs: Vec<crate::shadow::Job> = Vec::new();
+        for &i in &overlapping {
+            let (shadow, from, to) = self.refreshes[i].clone();
+            jobs.push(Box::new(move || Self::update(&shadow, from, to)));
+        }
+        if wide_refresh() && jobs.len() >= 2 {
+            // The time counted is the time it took, not the threads' sum.
+            let started = std::time::Instant::now();
+            let before = PREPARING[0].load(Ordering::Relaxed);
+            crate::shadow::wide_run(jobs);
+            let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
+            PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+        } else {
+            for job in jobs {
+                job();
+            }
+        }
+        if ranges.len() > 1 {
+            crate::watch::ask_ahead_done();
+        }
+        // Taken out, last to first, and the index rebuilt: `flush_one`
+        // searches by it, and a copy's place changes with each removal.
+        for &i in overlapping.iter().rev() {
+            self.refreshes.swap_remove(i);
+        }
+        self.index.clear();
+        for (at, r) in self.refreshes.iter().enumerate() {
+            self.index.insert(std::sync::Arc::as_ptr(&r.0) as usize, at);
+        }
     }
 
     fn flush(&mut self) {
