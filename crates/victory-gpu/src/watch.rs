@@ -79,10 +79,9 @@ pub(crate) fn take_kernel_stats() -> (u64, u64, u64, u64) {
 }
 
 /// Ranges of one submission closer than this are asked about together:
-/// walking the pages between them costs less than another kernel call (a
-/// call that resets written pages costs 30-70 microseconds whatever the
-/// range).
-const AHEAD_GAP: usize = (8 << 20) / PAGE;
+/// walking the pages between them (up to 32 MiB) costs less than another
+/// kernel call, which resets written pages and costs 30-70 microseconds.
+const AHEAD_GAP: usize = (32 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
